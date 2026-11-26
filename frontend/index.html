@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Мафия AI — Настольная игра (Ollama)</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-shell" id="appShell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <h1>МАФИЯ <span class="muted">AI</span></h1>
+      </div>
+
+      <div class="status-group">
+        <div class="badge" id="phaseBadge">Лобби</div>
+        <div class="badge role-badge hidden" id="roleBadge">Роль: —</div>
+      </div>
+
+      <div class="right-controls">
+        <button class="ollama-pill" id="ollamaStatusBtn" title="Нажмите, чтобы перепроверить связь с Ollama">
+          <span class="dot" id="ollamaDot"></span>
+          <span id="ollamaText">Проверка Ollama...</span>
+        </button>
+        <button class="btn btn-ghost btn-sm hidden" id="resetBtn" title="Прервать партию и выйти в лобби">
+          В лобби
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Layout -->
+    <main class="workspace">
+      <!-- Left Sidebar: Players around the table -->
+      <aside class="sidebar">
+        <div class="panel-header">
+          <span>ИГРОКИ ЗА СТОЛОМ</span>
+          <span class="count-label" id="aliveCountLabel">7 / 7</span>
+        </div>
+        <ul class="player-list" id="playerList">
+          <li class="empty-seats">Места распределятся в начале партии</li>
+        </ul>
+        <div class="rules-mini">
+          <div>• 7 игроков: 5 мирных, 2 мафии</div>
+          <div>• Игра <strong>в закрытую</strong> (роли скрыты до финала)</div>
+          <div>• День: 2 круга речей → голосование</div>
+        </div>
+      </aside>
+
+      <!-- Center Feed + Lobby / End Screen + Action Panel -->
+      <section class="stage">
+        <!-- Lobby View -->
+        <div class="lobby-card" id="lobbyView">
+          <h2>Новая партия за столом</h2>
+          <p class="subtitle">
+            Вы играете против 6 ИИ-соперников на базе локальной модели Ollama (<code id="lobbyModelCode">qwen2.5:7b</code>).
+            Роли, пол, имена и характеры ИИ генерируются случайно в каждой новой игре.
+          </p>
+
+          <div class="alert-box hidden" id="ollamaWarning"></div>
+
+          <form id="startForm" class="lobby-form">
+            <div class="field">
+              <div class="field-label-row">
+                <label for="modelSelect">Модель ИИ (из <code>ollama list</code>)</label>
+                <button type="button" class="link-btn" id="refreshModelsBtn" title="Пересканировать установленные в Ollama модели">
+                  ↻ Обновить список
+                </button>
+              </div>
+              <select id="modelSelect" required>
+                <option value="qwen2.5:7b">Загрузка моделей из Ollama...</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="playerNameInput">Ваше имя за столом</label>
+              <input
+                type="text"
+                id="playerNameInput"
+                maxlength="20"
+                value="Игрок"
+                placeholder="Например, Артём"
+                required
+              />
+            </div>
+
+            <div class="field">
+              <label>Ваш пол (для корректного обращения ИИ)</label>
+              <div class="segmented">
+                <label class="seg-option">
+                  <input type="radio" name="gender" value="M" checked />
+                  <span>Мужской</span>
+                </label>
+                <label class="seg-option">
+                  <input type="radio" name="gender" value="F" />
+                  <span>Женский</span>
+                </label>
+              </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-lg" id="startGameBtn">
+              Раздать карты и начать игру
+            </button>
+          </form>
+        </div>
+
+        <!-- Game Feed View -->
+        <div class="feed-container hidden" id="gameView">
+          <!-- Game Over Banner (revealed when phase === game_over) -->
+          <div class="gameover-card hidden" id="gameOverCard">
+            <div class="gameover-header">
+              <div>
+                <div class="gameover-kicker">ПАРТИЯ ЗАВЕРШЕНА — ВСКРЫТИЕ КАРТ</div>
+                <h2 id="winnerTitle">Победа!</h2>
+                <p id="winnerReason" class="muted"></p>
+              </div>
+              <div class="gameover-actions">
+                <button type="button" class="btn btn-ghost" id="toggleThoughtsBtn">
+                  Показать скрытые мысли ИИ
+                </button>
+                <button type="button" class="btn btn-primary" id="playAgainBtn">
+                  Новая партия
+                </button>
+              </div>
+            </div>
+            <div class="reveal-table-wrap">
+              <table class="reveal-table">
+                <thead>
+                  <tr>
+                    <th>№</th>
+                    <th>Игрок</th>
+                    <th>Истинная роль</th>
+                    <th>Характер ИИ</th>
+                    <th>Итог</th>
+                  </tr>
+                </thead>
+                <tbody id="revealTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Chat / Log Stream -->
+          <div class="chat-feed" id="chatFeed"></div>
+
+          <!-- Bottom Human Action Bar -->
+          <div class="action-bar" id="actionBar">
+            <!-- Idle / AI Thinking status -->
+            <div class="status-line" id="waitingStatusLine">
+              <span class="pulse-indicator"></span>
+              <span id="waitingStatusText">Ожидание начала хода...</span>
+            </div>
+
+            <!-- Speak Input -->
+            <form class="speak-form hidden" id="speakForm">
+              <input
+                type="text"
+                id="speakInput"
+                maxlength="500"
+                placeholder="Ваша очередь говорить за столом..."
+                autocomplete="off"
+              />
+              <button type="submit" class="btn btn-primary">Сказать</button>
+            </form>
+
+            <!-- Target Selection (Vote or Night Kill) -->
+            <form class="target-form hidden" id="targetForm">
+              <div class="target-prompt" id="targetPromptLabel">Выберите игрока:</div>
+              <div class="target-chips" id="targetChips"></div>
+              <div class="target-row">
+                <input
+                  type="text"
+                  id="targetCommentInput"
+                  maxlength="250"
+                  placeholder="Короткий комментарий (необязательно)..."
+                  autocomplete="off"
+                />
+                <button type="submit" class="btn btn-danger" id="confirmTargetBtn" disabled>
+                  Подтвердить выбор
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
