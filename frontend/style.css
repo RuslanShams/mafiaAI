@@ -538,6 +538,11 @@ select:focus {
   background: rgba(217, 72, 84, 0.08);
 }
 
+.msg-bubble.msg-streaming {
+  border-color: rgba(79, 124, 255, 0.55);
+  border-style: dashed;
+}
+
 .msg-header {
   display: flex;
   align-items: center;

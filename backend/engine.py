@@ -21,7 +21,7 @@ from backend.models import (
 from backend.personas import generate_ai_profiles
 from backend.prompts import (
     build_discussion_task_prompt,
-    build_intro_task_prompt,
+    build_last_word_prompt,
     build_night_kill_prompt,
     build_night_suggest_prompt,
     build_system_prompt,
@@ -36,9 +36,15 @@ BroadcastFn = Callable[[dict], Awaitable[None]]
 class GameEngine:
     """Manages a 7-player closed tabletop Mafia game (1 Human + 6 qwen2.5:7b AIs)."""
 
-    def __init__(self, llm: OllamaClient, broadcast: BroadcastFn) -> None:
+    def __init__(
+        self,
+        llm: OllamaClient,
+        broadcast: BroadcastFn,
+        spectator_delay: float = 0.8,
+    ) -> None:
         self.llm = llm
         self.broadcast = broadcast
+        self.spectator_delay = spectator_delay
         self.state = GameState()
         self._loop_task: Optional[asyncio.Task] = None
         self._human_event = asyncio.Event()
@@ -54,6 +60,7 @@ class GameEngine:
                 pass
         self._loop_task = None
         self.state.waiting_for_human = None
+        self.state.awaiting_last_word_seat = None
         self.state.active_speaker_seat = None
 
     async def reset_to_lobby(self) -> None:
@@ -64,6 +71,30 @@ class GameEngine:
     def _all_player_names(self) -> list[str]:
         return [p.name for p in self.state.players]
 
+    def _dead_player_names(self, exclude_seat: Optional[int] = None) -> list[str]:
+        return [
+            p.name
+            for p in self.state.players
+            if not p.is_alive and p.seat != exclude_seat
+        ]
+
+    def _unspoken_alive_names_today(self, exclude_seat: Optional[int] = None) -> list[str]:
+        if self.state.phase != Phase.DAY_DISCUSSION:
+            return []
+        spoken_seats = {
+            m.sender_seat
+            for m in self.state.messages
+            if m.day == self.state.day
+            and m.visibility == "public"
+            and m.phase == Phase.DAY_DISCUSSION
+            and m.sender_seat is not None
+        }
+        return [
+            p.name
+            for p in self.state.alive_players()
+            if p.seat != exclude_seat and p.seat not in spoken_seats
+        ]
+
     async def _ai_generate(
         self,
         player: Player,
@@ -73,6 +104,17 @@ class GameEngine:
         is_public_day: bool = True,
         fallback_kind: str = "discussion",
     ) -> dict[str, str]:
+        async def _stream_partial(partial_text: str) -> None:
+            await self.broadcast(
+                {
+                    "type": "stream_chunk",
+                    "seat": player.seat,
+                    "sender_name": player.name,
+                    "day": self.state.day,
+                    "text": partial_text,
+                }
+            )
+
         return await self.llm.generate_turn(
             player=player,
             system_prompt=system_prompt,
@@ -81,16 +123,39 @@ class GameEngine:
             is_public_day=is_public_day,
             fallback_kind=fallback_kind,
             allowed_names=self._all_player_names(),
+            dead_names=self._dead_player_names(exclude_seat=player.seat),
+            unspoken_names=self._unspoken_alive_names_today(exclude_seat=player.seat)
+            if fallback_kind == "discussion"
+            else None,
+            on_stream_text=_stream_partial if (is_public_day and valid_targets is None) else None,
         )
 
     def serialize_for_human(self) -> dict:
         human = self.state.human_player()
-        reveal_all = self.state.phase == Phase.GAME_OVER
+        # Reveal all roles either when game ends OR once human is eliminated AND done with their Last Word!
+        human_is_spectator = (
+            human is not None
+            and not human.is_alive
+            and self.state.awaiting_last_word_seat != human.seat
+            and self.state.waiting_for_human != "last_word"
+        )
+        reveal_all = self.state.phase == Phase.GAME_OVER or human_is_spectator
+        # Never show "Думает..." on any AI player during Night so Mafia is never exposed
+        visible_active_seat = (
+            self.state.active_speaker_seat
+            if (
+                self.state.phase != Phase.NIGHT
+                or (human is not None and self.state.active_speaker_seat == human.seat)
+            )
+            else None
+        )
 
         visible_messages = []
         for msg in self.state.messages:
-            if reveal_all:
+            if self.state.phase == Phase.GAME_OVER:
                 visible_messages.append(msg.to_client_dict(include_thought=True))
+            elif reveal_all:
+                visible_messages.append(msg.to_client_dict(include_thought=False))
             elif msg.visibility in ("public", "system"):
                 visible_messages.append(msg.to_client_dict(include_thought=False))
             elif msg.visibility == "mafia" and human and human.role == Role.MAFIA:
@@ -102,12 +167,13 @@ class GameEngine:
             "day": self.state.day,
             "round_num": self.state.round_num,
             "ai_model": self.state.ai_model,
+            "spectator_reveal": human_is_spectator,
             "players": [p.to_public_dict(viewer=human, reveal_all=reveal_all) for p in self.state.players],
             "messages": visible_messages,
             "winner": self.state.winner.value if self.state.winner else None,
             "winner_ru": self.state.winner.label_ru if self.state.winner else None,
             "win_reason": self.state.win_reason,
-            "active_speaker_seat": self.state.active_speaker_seat,
+            "active_speaker_seat": visible_active_seat,
             "waiting_for_human": self.state.waiting_for_human,
             "valid_targets": self.state.valid_targets,
             "mafia_suggestion": self.state.mafia_suggestion,
@@ -154,7 +220,7 @@ class GameEngine:
                     )
                 )
             else:
-                ai_name, ai_gender, ai_persona = next(ai_profiles)
+                ai_name, ai_gender = next(ai_profiles)
                 players.append(
                     Player(
                         seat=seat,
@@ -162,13 +228,13 @@ class GameEngine:
                         gender=ai_gender,
                         is_human=False,
                         role=role,
-                        persona=ai_persona,
+                        persona=None,
                     )
                 )
 
         self.state = GameState(
-            phase=Phase.DAY_INTRO,
-            day=0,
+            phase=Phase.NIGHT,
+            day=1,
             round_num=1,
             ai_model=self.llm.model,
             players=players,
@@ -184,7 +250,7 @@ class GameEngine:
 
         self._add_system_message(
             f"Партия началась! За столом 7 игроков: 5 мирных жителей и 2 мафии (модель ИИ: {self.llm.model}). "
-            "Игра идёт в закрытую — роли выбывших не раскрываются до конца партии."
+            "Игра идёт в закрытую, а в первую ночь мафия никого не убивает."
         )
         if human:
             self._add_Message_direct(
@@ -205,6 +271,9 @@ class GameEngine:
             if not cleaned:
                 return False
             self._human_payload = {"text": cleaned[:500]}
+        elif action_type == "last_word":
+            # Empty text is allowed if human clicks "Skip last word"
+            self._human_payload = {"text": text.strip()[:500]}
         elif action_type in ("vote", "night_kill"):
             if target not in self.state.valid_targets:
                 return False
@@ -260,6 +329,62 @@ class GameEngine:
         self.state.valid_targets = []
         return dict(self._human_payload)
 
+    def _is_victory_reached(self) -> bool:
+        mafia_alive = len(self.state.alive_mafia())
+        citizens_alive = len(self.state.alive_citizens())
+        return mafia_alive == 0 or mafia_alive >= citizens_alive
+
+    async def _run_last_word(self, player: Player, reason: str) -> None:
+        """Give an eliminated player (night victim or day execution) their Last Word if game continues."""
+        if self._is_victory_reached():
+            self.state.awaiting_last_word_seat = None
+            return
+
+        prev_phase = self.state.phase
+        if reason == "night":
+            self.state.phase = Phase.DAY_DISCUSSION
+        self.state.awaiting_last_word_seat = player.seat
+        self.state.active_speaker_seat = player.seat
+        self._add_system_message(f"Последнее слово выбывающего игрока {player.name}...")
+
+        if player.is_human:
+            # _wait_for_human sets waiting_for_human="last_word" BEFORE pushing state so input bar opens immediately!
+            payload = await self._wait_for_human("last_word")
+            text = payload.get("text", "").strip()
+            if text:
+                self._add_Message_direct(
+                    sender_seat=player.seat,
+                    sender_name=f"{player.name} (Последнее слово)",
+                    text=text,
+                    visibility="public",
+                )
+            else:
+                self._add_system_message(f"{player.name} покидает стол без последнего слова.")
+        else:
+            await self.push_state()
+            sys_prompt = build_system_prompt(player, self.state)
+            user_prompt = build_last_word_prompt(player, self.state, reason=reason)
+            res = await self._ai_generate(
+                player=player,
+                system_prompt=sys_prompt,
+                user_prompt=user_prompt,
+                is_public_day=True,
+                fallback_kind="last_word",
+            )
+            self._add_Message_direct(
+                sender_seat=player.seat,
+                sender_name=f"{player.name} (Последнее слово)",
+                text=res["speech"],
+                visibility="public",
+                thought=res["thought"],
+            )
+            await self._pace_if_spectating()
+
+        self.state.awaiting_last_word_seat = None
+        self.state.active_speaker_seat = None
+        self.state.phase = prev_phase
+        await self.push_state()
+
     def _check_victory(self) -> bool:
         mafia_alive = len(self.state.alive_mafia())
         citizens_alive = len(self.state.alive_citizens())
@@ -285,21 +410,18 @@ class GameEngine:
 
     async def _pace_if_spectating(self) -> None:
         human = self.state.human_player()
-        if human and not human.is_alive:
-            await asyncio.sleep(0.8)
+        if human and not human.is_alive and self.spectator_delay > 0:
+            await asyncio.sleep(self.spectator_delay)
 
     async def _run_game_loop(self) -> None:
         try:
-            # 1. Day 0: Short acquaintance round
-            await self._run_intro_round()
-
-            # 2. Main Night -> Day Discussion -> Day Voting cycle
+            self.state.day = 0
             while self.state.phase != Phase.GAME_OVER:
                 self.state.day += 1
                 day_rec = DayRecord(day=self.state.day)
                 self.state.history.append(day_rec)
 
-                # Night Phase
+                # Night Phase (Night 1 has NO kill — acquaintance night only!)
                 await self._run_night_phase(day_rec)
                 if self._check_victory():
                     self.state.active_speaker_seat = None
@@ -324,52 +446,32 @@ class GameEngine:
             self._add_system_message(f"Произошла техническая ошибка в движке партии: {exc}")
             await self.push_state()
 
-    async def _run_intro_round(self) -> None:
-        self.state.phase = Phase.DAY_INTRO
-        self.state.day = 0
-        self.state.round_num = 1
-        self._add_system_message("Нулевой круг — короткое знакомство за столом перед первой ночью.")
-        await self.push_state()
-
-        for player in self._ordered_alive_players():
-            self.state.active_speaker_seat = player.seat
-            await self.push_state()
-
-            if player.is_human:
-                payload = await self._wait_for_human("speak")
-                self._add_Message_direct(
-                    sender_seat=player.seat,
-                    sender_name=player.name,
-                    text=payload["text"],
-                    visibility="public",
-                )
-            else:
-                sys_prompt = build_system_prompt(player, self.state)
-                user_prompt = build_intro_task_prompt(player, self.state)
-                res = await self._ai_generate(
-                    player=player,
-                    system_prompt=sys_prompt,
-                    user_prompt=user_prompt,
-                    is_public_day=True,
-                    fallback_kind="intro",
-                )
-                self._add_Message_direct(
-                    sender_seat=player.seat,
-                    sender_name=player.name,
-                    text=res["speech"],
-                    visibility="public",
-                    thought=res["thought"],
-                )
-            await self.push_state()
-
-        self.state.active_speaker_seat = None
-        await self.push_state()
-
     async def _run_night_phase(self, day_rec: DayRecord) -> None:
         self.state.phase = Phase.NIGHT
         self.state.round_num = 1
         self.state.mafia_suggestion = None
         self.state.current_votes = {}
+
+        # Night 1: Non-lethal acquaintance night!
+        if self.state.day == 1:
+            alive_mafia = self.state.alive_mafia()
+            if len(alive_mafia) == 2:
+                m1, m2 = alive_mafia[0], alive_mafia[1]
+                sender = m2 if m1.is_human else m1
+                other = m1 if m1.is_human else m2
+                self._add_Message_direct(
+                    sender_seat=sender.seat,
+                    sender_name=f"{sender.name} (Мафия)",
+                    text=f"Работаем в паре с {other.name}. Первая ночь без выстрела — днём ведём себя естественно и не выдаём связку.",
+                    visibility="mafia",
+                )
+            self._add_system_message(
+                "Первая ночь прошла мирно: мафия познакомилась друг с другом без выстрела. "
+                "Наступает День 1 — все 7 игроков за столом!"
+            )
+            await self.push_state()
+            return
+
         self._add_system_message(f"Наступает Ночь {self.state.day}. Город засыпает, просыпается Мафия...")
         await self.push_state()
 
@@ -419,65 +521,26 @@ class GameEngine:
                 visibility="mafia",
             )
         else:
-            # AI-only Mafia night
-            if len(ai_mafia) == 2:
-                m1, m2 = ai_mafia[0], ai_mafia[1]
-                self.state.active_speaker_seat = m1.seat
-                await self.push_state()
-                res1 = await self._ai_generate(
-                    player=m1,
-                    system_prompt=build_system_prompt(m1, self.state),
-                    user_prompt=build_night_suggest_prompt(m1, m2, self.state, valid_targets),
-                    valid_targets=valid_targets,
-                    is_public_day=False,
-                    fallback_kind="night",
-                )
-                self._add_Message_direct(
-                    sender_seat=m1.seat,
-                    sender_name=f"{m1.name} (Мафия)",
-                    text=f"{res1['speech']} [Предлагает: {res1['target']}]",
-                    visibility="mafia",
-                    thought=res1["thought"],
-                )
-
-                self.state.active_speaker_seat = m2.seat
-                await self.push_state()
-                res2 = await self._ai_generate(
-                    player=m2,
-                    system_prompt=build_system_prompt(m2, self.state),
-                    user_prompt=build_night_kill_prompt(m2, self.state, valid_targets),
-                    valid_targets=valid_targets,
-                    is_public_day=False,
-                    fallback_kind="night",
-                )
-                chosen_target_name = res2["target"]
-                self._add_Message_direct(
-                    sender_seat=m2.seat,
-                    sender_name=f"{m2.name} (Мафия)",
-                    text=f"{res2['speech']} [Решено убрать: {chosen_target_name}]",
-                    visibility="mafia",
-                    thought=res2["thought"],
-                )
-            else:
-                sole = ai_mafia[0]
-                self.state.active_speaker_seat = sole.seat
-                await self.push_state()
-                res = await self._ai_generate(
-                    player=sole,
-                    system_prompt=build_system_prompt(sole, self.state),
-                    user_prompt=build_night_kill_prompt(sole, self.state, valid_targets),
-                    valid_targets=valid_targets,
-                    is_public_day=False,
-                    fallback_kind="night",
-                )
-                chosen_target_name = res["target"]
-                self._add_Message_direct(
-                    sender_seat=sole.seat,
-                    sender_name=f"{sole.name} (Мафия)",
-                    text=f"{res['speech']} [Выстрел в: {chosen_target_name}]",
-                    visibility="mafia",
-                    thought=res["thought"],
-                )
+            # AI-only Mafia night: 1 fast decision call (rotating lead mafia between nights)
+            shooter = ai_mafia[(self.state.day - 1) % len(ai_mafia)]
+            self.state.active_speaker_seat = shooter.seat
+            await self.push_state()
+            res = await self._ai_generate(
+                player=shooter,
+                system_prompt=build_system_prompt(shooter, self.state),
+                user_prompt=build_night_kill_prompt(shooter, self.state, valid_targets),
+                valid_targets=valid_targets,
+                is_public_day=False,
+                fallback_kind="night",
+            )
+            chosen_target_name = res["target"]
+            self._add_Message_direct(
+                sender_seat=shooter.seat,
+                sender_name=f"{shooter.name} (Мафия)",
+                text=f"{res['speech']} [Выстрел в: {chosen_target_name}]",
+                visibility="mafia",
+                thought=res["thought"],
+            )
 
         self.state.active_speaker_seat = None
         self.state.mafia_suggestion = None
@@ -493,7 +556,13 @@ class GameEngine:
                 f"Наступает утро Дня {self.state.day}. Этой ночью {killed_verb} {victim.name}. "
                 "По правилам закрытой игры роль не раскрывается."
             )
-        await self.push_state()
+            if not self._is_victory_reached():
+                self.state.awaiting_last_word_seat = victim.seat
+                await self._run_last_word(victim, reason="night")
+            else:
+                await self.push_state()
+        else:
+            await self.push_state()
 
     async def _run_day_discussion(self) -> None:
         self.state.phase = Phase.DAY_DISCUSSION
@@ -567,7 +636,7 @@ class GameEngine:
             if player.is_human:
                 payload = await self._wait_for_human("vote", valid_targets=valid_targets)
                 target_name = payload["target"]
-                reason_text = payload.get("text") or f"Голосую против {target_name}."
+                reason_text = payload.get("text") or f"Мой голос — {target_name}."
                 self._add_Message_direct(
                     sender_seat=player.seat,
                     sender_name=player.name,
@@ -632,5 +701,11 @@ class GameEngine:
                     f"Итоги голосования ({tally_summary}). Большинством голосов стол {left_verb} {executed_player.name}. "
                     "В закрытой игре истинная роль остаётся в тайне."
                 )
+                if not self._is_victory_reached():
+                    self.state.awaiting_last_word_seat = executed_player.seat
+                    await self._run_last_word(executed_player, reason="vote")
+                else:
+                    await self.push_state()
+                return
 
         await self.push_state()

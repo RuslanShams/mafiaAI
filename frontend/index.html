@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Мафия AI — Настольная игра (Ollama)</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
   <div class="app-shell" id="appShell">
@@ -44,6 +44,7 @@
         </ul>
         <div class="rules-mini">
           <div>• 7 игроков: 5 мирных, 2 мафии</div>
+          <div>• Первая ночь — без убийства</div>
           <div>• Игра <strong>в закрытую</strong> (роли скрыты до финала)</div>
           <div>• День: 2 круга речей → голосование</div>
         </div>
@@ -55,8 +56,8 @@
         <div class="lobby-card" id="lobbyView">
           <h2>Новая партия за столом</h2>
           <p class="subtitle">
-            Вы играете против 6 ИИ-соперников на базе локальной модели Ollama (<code id="lobbyModelCode">qwen2.5:7b</code>).
-            Роли, пол, имена и характеры ИИ генерируются случайно в каждой новой игре.
+            Вы играете против 6 ИИ-соперников на базе локальной модели Ollama (<code id="lobbyModelCode">gemma3:4b</code>).
+            Роли, места, пол и имена ИИ распределяются случайно в каждой новой игре.
           </p>
 
           <div class="alert-box hidden" id="ollamaWarning"></div>
@@ -117,9 +118,6 @@
                 <p id="winnerReason" class="muted"></p>
               </div>
               <div class="gameover-actions">
-                <button type="button" class="btn btn-ghost" id="toggleThoughtsBtn">
-                  Показать скрытые мысли ИИ
-                </button>
                 <button type="button" class="btn btn-primary" id="playAgainBtn">
                   Новая партия
                 </button>
@@ -132,7 +130,6 @@
                     <th>№</th>
                     <th>Игрок</th>
                     <th>Истинная роль</th>
-                    <th>Характер ИИ</th>
                     <th>Итог</th>
                   </tr>
                 </thead>
@@ -152,7 +149,7 @@
               <span id="waitingStatusText">Ожидание начала хода...</span>
             </div>
 
-            <!-- Speak Input -->
+            <!-- Speak / Last Word Input -->
             <form class="speak-form hidden" id="speakForm">
               <input
                 type="text"
@@ -161,7 +158,8 @@
                 placeholder="Ваша очередь говорить за столом..."
                 autocomplete="off"
               />
-              <button type="submit" class="btn btn-primary">Сказать</button>
+              <button type="submit" class="btn btn-primary" id="speakSubmitBtn">Сказать</button>
+              <button type="button" class="btn btn-ghost hidden" id="skipLastWordBtn">Пропустить</button>
             </form>
 
             <!-- Target Selection (Vote or Night Kill) -->
@@ -187,7 +185,7 @@
     </main>
   </div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>
 

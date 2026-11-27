@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -60,6 +60,15 @@ app = FastAPI(title="Мафия AI (qwen2.5:7b)", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
+@app.middleware("http")
+async def disable_static_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(str(FRONTEND_DIR / "index.html"))
@@ -78,6 +87,8 @@ async def ws_game(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "state", "state": game_engine.serialize_for_human()})
         health = await llm_client.check_health()
         await websocket.send_json({"type": "health", "health": health})
+        if health.get("ollama_online") and health.get("model_ready") and game_engine.state.phase == Phase.LOBBY:
+            llm_client.schedule_warmup()
 
         while True:
             data = await websocket.receive_json()
@@ -96,6 +107,8 @@ async def ws_game(websocket: WebSocket) -> None:
                         health = await llm_client.check_health()
                         await ws_manager.broadcast({"type": "health", "health": health})
                         await game_engine.push_state()
+                        if health.get("ollama_online") and health.get("model_ready"):
+                            llm_client.schedule_warmup()
 
             elif action == "start_game":
                 player_name = str(data.get("name", "Игрок"))
@@ -112,7 +125,7 @@ async def ws_game(websocket: WebSocket) -> None:
             elif action == "reset_lobby":
                 await game_engine.reset_to_lobby()
 
-            elif action in ("speak", "vote", "night_kill"):
+            elif action in ("speak", "last_word", "vote", "night_kill"):
                 ok = game_engine.submit_human_input(
                     action_type=action,
                     text=str(data.get("text", "")),

@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+import random
+import re
 from typing import Optional
 
-from backend.models import GameState, Gender, Phase, Player, Role
+from backend.models import ChatMessage, GameState, Gender, Phase, Player, Role
+
+# Shared system prompt (cached in Ollama KV-cache across turns)
+STATIC_SYSTEM_PROMPT = (
+    "Настольная игра «Мафия» в текстовом чате (7 игроков: 5 мирных, 2 мафии; первая ночь без убийств). "
+    "ИГРА В ЗАКРЫТУЮ: роли выбывших НЕ раскрываются до финала. "
+    "Железные правила логики и речи:\n"
+    "- За столом строгая очерёдность ходов: КАЖДЫЙ живой игрок обязательно высказывается в свою очередь! СТРОГО ЗАПРЕЩЕНО обвинять кого-либо в «молчании», «молчаливости», «отмалчивании» или в том, что он «мало говорит».\n"
+    "- Общение идёт ТОЛЬКО текстом: не пиши про чужие лица, взгляды или «нервозность» — суди строго по смыслу сказанных фраз (противоречия, уход от вопросов, перевод стрелок) и прошлым голосам.\n"
+    "- Игроков, до которых очередь в круге ещё не дошла, нельзя оценивать — им можно только задать вопрос.\n"
+    "- Мёртвых игроков НЕЛЬЗЯ подозревать или спрашивать.\n"
+    "- Не поддакивай стадно чужим обвинениям без фактов. Говори простым русским языком на «ты», строго от первого лица («я», «мне»), без своего имени в 3-м лице."
+)
+
+_TACTICAL_ANGLES = (
+    "Твой фокус: проверяй, есть ли логика за чужими обвинениями; кто кидает пустые обвинения без аргументов — сам подозрителен.",
+    "Твой фокус: следи за связками — кто с кем слишком охотно соглашается и выгораживает друг друга.",
+    "Твой фокус: цепляйся к нестыковкам и уклончивым формулировкам уже высказавшихся игроков.",
+    "Твой фокус: думай независимо от толпы — предлагай свой взгляд на сказанные выше реплики.",
+)
 
 
 def _get_mafia_partner(player: Player, all_players: list[Player]) -> Optional[Player]:
@@ -14,184 +35,257 @@ def _get_mafia_partner(player: Player, all_players: list[Player]) -> Optional[Pl
     return None
 
 
-def build_system_prompt(player: Player, state: GameState) -> str:
-    """Build strictly isolated system prompt for a single AI player."""
-    gender_instruction = (
-        "Твой пол — МУЖСКОЙ. Всегда говори о себе строго в мужском роде (я подумал, я заметил, я уверен, согласен)."
-        if player.gender == Gender.MALE
-        else "Твой пол — ЖЕНСКИЙ. Всегда говори о себе строго в женском роде (я подумала, я заметила, я уверена, согласна)."
-    )
-
-    persona_title = player.persona.title if player.persona else "Обычный игрок"
-    persona_style = player.persona.prompt_style if player.persona else "Говори естественно и по делу."
-
-    if player.role == Role.CITIZEN:
-        role_block = (
-            "ТВОЯ СЕКРЕТНАЯ РОЛЬ: МИРНЫЙ ЖИТЕЛЬ.\n"
-            "- Ты НЕ знаешь, кто из остальных 6 игроков мафия, а кто мирный.\n"
-            "- Твоя цель — вычислить двух игроков мафии по нестыковкам в их речах, поведению и голосованиям, "
-            "и убедить стол проголосовать против них.\n"
-            "- Защищай себя, если тебя несправедливо подозревают, но не верь никому слепо."
-        )
+def build_name_mention_regex(name: str) -> re.Pattern:
+    """Build case-insensitive regex matching Russian declensions of a first name."""
+    low = name.strip().lower().replace("ё", "[её]")
+    if low == "павел":
+        stem = "пав(?:ел|л)"
+    elif low == "лев":
+        stem = "л(?:ев|ьв)"
+    elif len(low) >= 4 and low[-1] in ("а", "я", "й", "ь"):
+        stem = re.escape(low[:-1]).replace(r"\[её\]", "[её]")
     else:
-        partner = _get_mafia_partner(player, state.players)
-        if partner:
-            partner_status = "сейчас ЖИВ(А)" if partner.is_alive else "УЖЕ ВЫБЫЛ(А) из игры"
-            partner_line = f"Твой единственный напарник по мафии: {partner.name} ({partner_status})."
-        else:
-            partner_line = "Ты единственный представитель мафии."
-        role_block = (
-            "ТВОЯ СЕКРЕТНАЯ РОЛЬ: МАФИЯ.\n"
-            f"- {partner_line} Все остальные игроки за столом — мирные жители.\n"
-            "- СТРОЖАЙШИЙ ЗАПРЕТ ДНЁМ: никогда не признавайся за общим столом, что ты или твой напарник — мафия! "
-            "Днём ты обязан(а) убедительно отыгрывать роль мирного жителя, который якобы ищет мафию.\n"
-            "- Тактика мафии днём: переводи подозрения на убедительных кандидатов среди мирных, подхватывай чужие ошибки, "
-            "не защищай напарника слишком очевидно, чтобы вас не вычислили парой. Если напарника прижали фактами — "
-            "действуй осторожно, чтобы не утонуть вместе с ним.\n"
-            "- Победа мафии наступает, когда число живых мафиози сравняется с числом живых мирных."
-        )
+        stem = re.escape(low).replace(r"\[её\]", "[её]")
+    return re.compile(rf"(?<![а-яё]){stem}[а-яё]{{0,3}}(?![а-яё])", re.IGNORECASE)
 
-    return (
-        f"Ты — живой человек по имени {player.name}, играющий за столом в классическую настольную игру «Мафия».\n"
-        f"{gender_instruction}\n\n"
-        f"ХАРАКТЕР И МАНЕРА РЕЧИ ({persona_title}):\n"
-        f"{persona_style}\n\n"
-        "ПРАВИЛА ЭТОЙ ПАРТИИ:\n"
-        "- Всего в начале игры было 7 игроков: 2 Мафии и 5 Мирных жителей (комиссара и доктора нет).\n"
-        "- ИГРА В ЗАКРЫТУЮ: когда игрока убивают ночью или казнят днём на голосовании, ведущий НЕ объявляет его роль! "
-        "Роли выбывших игроков остаются тайной до самого конца игры. Не утверждай как доказанный факт роль выбывшего, "
-        "если ты её не знаешь наверняка.\n\n"
-        f"{role_block}\n\n"
-        "ЖЕСТКИЕ ТРЕБОВАНИЯ К ЯЗЫКУ И ФОРМАТУ:\n"
-        "1. Пиши ИСКЛЮЧИТЕЛЬНО на чистом, живом русском языке. Никаких китайских иероглифов, английских слов (кроме ключей JSON) и эмодзи.\n"
-        "2. Говори ТОЛЬКО в контексте партии за игровым столом. Запрещено упоминать ИИ, нейросети, языковые модели, промпты или правила генерации.\n"
-        "3. Не выдумывай реплики или голосования, которых не было в логе игры. Обращайся только к реально существующим за столом игрокам.\n"
-        "4. Возвращай ответ СТРОГО в формате валидного JSON-объекта без обёрток и комментариев вне JSON."
-    )
+
+def find_direct_mentions_for_player(player: Player, state: GameState) -> list[ChatMessage]:
+    """Find public discussion messages today (since `player`'s last speech) from ALIVE players that mention `player`."""
+    alive_seats = {p.seat for p in state.alive_players()}
+    today_public = [
+        m
+        for m in state.messages
+        if m.day == state.day
+        and m.visibility == "public"
+        and m.phase == Phase.DAY_DISCUSSION
+    ]
+    last_own_idx = -1
+    for idx, m in enumerate(today_public):
+        if m.sender_seat == player.seat:
+            last_own_idx = idx
+    candidates = today_public[last_own_idx + 1 :]
+
+    pattern = build_name_mention_regex(player.name)
+    return [
+        m
+        for m in candidates
+        if m.sender_seat != player.seat
+        and m.sender_seat in alive_seats
+        and pattern.search(m.text)
+    ]
+
+
+def build_system_prompt(_player: Player, _state: GameState) -> str:
+    return STATIC_SYSTEM_PROMPT
+
+
+def _shuffled_names(names: list[str], seed_key: int) -> list[str]:
+    if len(names) <= 1:
+        return list(names)
+    rng = random.Random(seed_key)
+    copied = list(names)
+    rng.shuffle(copied)
+    return copied
 
 
 def build_table_state_block(player: Player, state: GameState) -> str:
-    """Build factual game summary with zero leakage of hidden roles."""
-    alive_list = []
-    dead_list = []
+    rivals_alive = []
+    dead_items = []
     for p in state.players:
         g = "М" if p.gender == Gender.MALE else "Ж"
-        self_mark = " (ЭТО ТЫ)" if p.seat == player.seat else ""
         if p.is_alive:
-            alive_list.append(f"- [{p.seat}] {p.name} ({g}){self_mark}")
+            if p.seat != player.seat:
+                rivals_alive.append(f"{p.name}({g})")
         else:
-            how = "убит(а) ночью" if p.death_reason == "night" else "казнён(а) на голосовании"
-            dead_list.append(f"- [{p.seat}] {p.name} ({g}) — ВЫБЫЛ(А): {how} (день {p.death_day}, роль не раскрыта)")
+            if p.seat != player.seat:
+                how = "убит мафией ночью" if p.death_reason == "night" else "казнён городом днём"
+                dead_items.append(f"{p.name} ({how} {p.death_day})")
 
-    lines = [
-        f"ТЕКУЩИЙ МОМЕНТ: День {state.day}, фаза: {state.phase.label_ru}.",
-        f"В живых осталось: {len(state.alive_players())} чел.",
-        "ЖИВЫЕ ИГРОКИ ЗА СТОЛОМ:",
-        *alive_list,
-    ]
-    if dead_list:
-        lines.append("\nВЫБЫВШИЕ ИГРОКИ (не могут говорить, за них нельзя голосовать):")
-        lines.extend(dead_list)
+    lines: list[str] = []
 
-    # Past days factual archive
-    past_records = [r for r in state.history if r.day < state.day or (r.day == state.day and r.night_victim)]
-    if past_records:
-        lines.append("\nФАКТЫ ПРОШЛЫХ РАУНДОВ:")
-        for rec in past_records:
-            parts = [f"День {rec.day}:"]
-            if rec.night_victim:
-                parts.append(f"ночью убит(а) {rec.night_victim}.")
-            if rec.votes:
-                votes_str = ", ".join(f"{voter} -> {target}" for voter, target in rec.votes.items())
-                parts.append(f"Голоса днём: [{votes_str}].")
-            if rec.executed:
-                parts.append(f"Казнён(а): {rec.executed} (роль неизвестна).")
-            elif rec.tie_no_execution:
-                parts.append("Ничья на голосовании — никто не казнён.")
+    today_rec = next((r for r in state.history if r.day == state.day), None)
+    if state.day == 1:
+        lines.append("День 1 (первая ночь прошла без убийств, все 7 игроков живы, улик ещё нет).")
+    elif today_rec and today_rec.night_victim:
+        lines.append(
+            f"День {state.day}: этой ночью мафия убила игрока {today_rec.night_victim} ({today_rec.night_victim} мёртв и выбыл)."
+        )
+
+    if dead_items:
+        lines.append(
+            f"МЁРТВЫЕ (выбыли навсегда — НЕ подозревать их и НЕ обращаться к ним!): {', '.join(dead_items)}."
+        )
+
+    past_records = [r for r in state.history if r.day < state.day]
+    for rec in past_records[-2:]:
+        parts = [f"Архив Д{rec.day}:"]
+        if rec.night_victim:
+            parts.append(f"ночью убит {rec.night_victim};")
+        if rec.votes:
+            v_str = ", ".join(f"{v}->{t}" for v, t in rec.votes.items())
+            parts.append(f"голоса [{v_str}];")
+        if rec.executed:
+            parts.append(f"казнён {rec.executed}.")
+        elif rec.tie_no_execution:
+            parts.append("ничья.")
+        if len(parts) > 1:
             lines.append(" ".join(parts))
 
-    # Private mafia night log ONLY for mafia players
-    if player.role == Role.MAFIA:
+    seat_gender = {p.seat: ("М" if p.gender == Gender.MALE else "Ж") for p in state.players}
+    today_discussion = [
+        m
+        for m in state.messages
+        if m.day == state.day
+        and m.visibility == "public"
+        and m.phase == Phase.DAY_DISCUSSION
+    ]
+    if today_discussion:
+        lines.append("Реплики за столом сегодня:")
+        for m in today_discussion[-14:]:
+            g = seat_gender.get(m.sender_seat or -1, "")
+            if m.sender_seat == player.seat:
+                author = f"Я ({m.sender_name})"
+            elif "Последнее слово" in m.sender_name:
+                author = f"{m.sender_name} [уже выбыл]"
+            else:
+                author = f"{m.sender_name}({g})" if g else m.sender_name
+            lines.append(f"- {author}: {m.text}")
+
+    if state.phase == Phase.DAY_VOTING and state.current_votes:
+        cast_str = ", ".join(f"{voter} -> против {target}" for voter, target in state.current_votes.items())
+        lines.append(f"Уже проголосовали сейчас: {cast_str}.")
+
+    gender_hint = (
+        "мужской род: я сказал, я уверен"
+        if player.gender == Gender.MALE
+        else "женский род: я сказала, я уверена"
+    )
+    shuffled_rivals = _shuffled_names(rivals_alive, seed_key=player.seat * 31 + state.day * 7 + state.round_num)
+    angle = _TACTICAL_ANGLES[(player.seat + state.day) % len(_TACTICAL_ANGLES)]
+
+    lines.append(
+        f"\nТвоя карточка: ТЫ — {player.name} ({gender_hint}; пиши о себе ТОЛЬКО «я/мне/меня», без имени «{player.name}»!)."
+    )
+    if shuffled_rivals:
+        lines.append(f"Живые соперники: {', '.join(shuffled_rivals)}.")
+    lines.append(angle)
+
+    if player.role == Role.CITIZEN:
+        lines.append("ТВОЯ СЕКРЕТНАЯ РОЛЬ: МИРНЫЙ ЖИТЕЛЬ. Чужие роли неизвестны, вычисляй двух мафиози по смыслу их слов и голосам.")
+    else:
+        partner = _get_mafia_partner(player, state.players)
+        if partner:
+            p_state = "ЖИВ — он за столом" if partner.is_alive else "МЁРТВ — уже выбыл"
+            partner_str = f"Твой напарник по мафии: {partner.name} ({p_state})."
+        else:
+            partner_str = "Ты один в мафии."
+        lines.append(
+            f"ТВОЯ СЕКРЕТНАЯ РОЛЬ: МАФИЯ. {partner_str} Днём притворяйся рассудительным мирным, не выдавай себя и напарника."
+        )
         mafia_msgs = [m for m in state.messages if m.visibility == "mafia"]
         if mafia_msgs:
-            lines.append("\nСЕКРЕТНЫЙ НОЧНОЙ ЧАТ МАФИИ (известен только мафии):")
-            for m in mafia_msgs[-8:]:
-                lines.append(f"[Ночь {m.day}] {m.sender_name}: {m.text}")
-
-    # Public speeches of the current day (or Day 0 intro if Day 1)
-    if state.day == 0:
-        recent_public = [m for m in state.messages if m.visibility in ("public", "system")]
-    else:
-        day0_msgs = [m for m in state.messages if m.day == 0 and m.visibility == "public"]
-        today_msgs = [m for m in state.messages if m.day == state.day and m.visibility in ("public", "system")]
-        # Include Day 0 intro on Day 1 so players remember initial impressions
-        recent_public = (day0_msgs + today_msgs) if state.day == 1 else today_msgs
-
-    if recent_public:
-        lines.append("\nСТЕНОГРАММА ТЕКУЩЕГО ОБСУЖДЕНИЯ ЗА СТОЛОМ:")
-        for m in recent_public[-24:]:
-            if m.visibility == "system":
-                lines.append(f"[Ведущий]: {m.text}")
-            else:
-                vote_suffix = f" [ГОЛОС ПРОТИВ: {m.vote_target}]" if m.vote_target else ""
-                lines.append(f"{m.sender_name}: «{m.text}»{vote_suffix}")
+            lines.append(
+                "СЕКРЕТНЫЙ НОЧНОЙ ЧАТ МАФИИ: "
+                + " | ".join(f"{m.sender_name}: {m.text}" for m in mafia_msgs[-2:])
+            )
 
     return "\n".join(lines)
 
 
-def build_intro_task_prompt(player: Player, state: GameState) -> str:
-    context = build_table_state_block(player, state)
-    return (
-        f"{context}\n\n"
-        "ЗАДАНИЕ (Знакомство перед первой ночью):\n"
-        f"Сейчас нулевой круг знакомства. Скажи от лица игрока {player.name} короткую вступительную реплику (1-2 предложения) "
-        "в своём характере: поприветствуй стол, покажи свой настрой на игру. Ночи и убийств ещё не было, поэтому никого предметно обвинять рано.\n"
-        "Верни СТРОГО JSON:\n"
-        '{"thought": "твоя короткая скрытая мысль в 1 предложении", "speech": "твоя реплика вслух на русском языке (1-2 предложения)"}'
-    )
-
-
 def build_discussion_task_prompt(player: Player, state: GameState) -> str:
     context = build_table_state_block(player, state)
-    other_alive = [p.name for p in state.alive_players() if p.seat != player.seat]
-    others_str = ", ".join(other_alive)
 
-    if state.round_num == 1:
-        round_hint = (
-            "Сейчас 1-й круг обсуждения этого дня. Проанализируй ночное убийство и прошлые события, "
-            f"выскажи свои подозрения или наблюдения относительно живых игроков ({others_str}) и при желании задай прямой вопрос кому-то из них."
+    alive_seats = {p.seat for p in state.alive_players()}
+    today_discussion = [
+        m
+        for m in state.messages
+        if m.day == state.day
+        and m.visibility == "public"
+        and m.phase == Phase.DAY_DISCUSSION
+        and m.sender_seat in alive_seats
+    ]
+    spoken_seats = {m.sender_seat for m in today_discussion if m.sender_seat is not None}
+    other_alive = [p for p in state.alive_players() if p.seat != player.seat]
+    seed = player.seat * 17 + state.day * 13 + state.round_num
+
+    already_spoke = _shuffled_names([p.name for p in other_alive if p.seat in spoken_seats], seed)
+    not_yet_turn = _shuffled_names([p.name for p in other_alive if p.seat not in spoken_seats], seed + 1)
+    rivals_shuffled = _shuffled_names([p.name for p in other_alive], seed + 2)
+
+    mentions = find_direct_mentions_for_player(player, state)
+
+    if mentions:
+        last_m = mentions[-1]
+        return (
+            f"{context}\n"
+            f"ТЕБЯ УПОМЯНУЛ ИГРОК {last_m.sender_name}: «{last_m.text}»\n"
+            f"Ответь игроку {last_m.sender_name} строго от ПЕРВОГО лица («я», «мне»): если к тебе вопрос или наезд — ответь по делу ИЛИ прямо откажись отвечать на провокацию; если тебя поддержали — коротко отреагируй (не обвиняй никого в молчании!, 1-2 предложения):"
+        )
+
+    if state.day == 1 and state.round_num == 1 and len(today_discussion) == 0:
+        rivals_str = ", ".join(rivals_shuffled)
+        return (
+            f"{context}\n"
+            f"Ты открываешь День 1 первым (очередь других ещё впереди!). Поздоровайся по-простому и задай вопрос на «ты» одному игроку из ({rivals_str}), с чего начнём искать мафию (1-2 коротких предложения):"
+        )
+
+    if not_yet_turn:
+        spoke_block = (
+            f"Уже сходили в этом круге (комментировать слова можно ТОЛЬКО у них): {', '.join(already_spoke)}.\n"
+            f"Очередь хода ещё впереди (они выступят позже, НЕ оценивай их и НЕ говори что они молчат!): {', '.join(not_yet_turn)}."
         )
     else:
-        round_hint = (
-            "Сейчас 2-й (заключительный перед голосованием) круг обсуждения. "
-            "Обязательно отреагируй на реплики из 1-го круга (особенно если кто-то упомянул или обвинил тебя!), "
-            f"и чётко обозначь, кого из живых ({others_str}) ты сейчас считаешь главным кандидатом на голосование и почему."
+        spoke_block = f"Все живые соперники уже высказались ({', '.join(already_spoke)})."
+
+    if state.round_num == 1:
+        if state.day == 1:
+            ask_target_pool = ", ".join(not_yet_turn if not_yet_turn else already_spoke)
+            spoke_str = ", ".join(already_spoke)
+            task = (
+                f"Начало 1-го дня — не обвиняй никого в молчании! "
+                f"Отреагируй по смыслу на реплику кого-то из ({spoke_str}) ИЛИ задай прямой вопрос на «ты» игроку из ({ask_target_pool})."
+            )
+        else:
+            rivals_str = ", ".join(rivals_shuffled)
+            task = (
+                f"Обсуди, кому из ЖИВЫХ ({rivals_str}) было выгодно ночное убийство судя по прошлым голосам и их словам (не обвиняй в молчании!), "
+                f"и предъяви аргумент кому-то из ({rivals_str})."
+            )
+    else:
+        rivals_str = ", ".join(rivals_shuffled)
+        task = (
+            f"Второй круг перед голосованием: назови от лица «я», чьи СЛОВА или АРГУМЕНТЫ из ({rivals_str}) кажутся тебе самыми неискренними или подозрительными и почему (без обвинений в молчании!)."
         )
 
-    return (
-        f"{context}\n\n"
-        f"ЗАДАНИЕ (Дневная речь игрока {player.name}, круг {state.round_num} из 2):\n"
-        f"{round_hint}\n"
-        "Длина реплики `speech`: 2-3 живых, естественных предложения на русском языке без повторения чужих слов слово в слово.\n"
-        "Верни СТРОГО JSON:\n"
-        '{"thought": "скрытая тактическая мысль (1-2 предложения, её никто не услышит)", '
-        '"speech": "твоя речь вслух за столом на русском языке (2-3 предложения)"}'
+    return f"{context}\n{spoke_block}\n{task} 1-2 коротких предложения:"
+
+
+def build_last_word_prompt(player: Player, state: GameState, reason: str) -> str:
+    context = build_table_state_block(player, state)
+    alive_names = ", ".join(p.name for p in state.alive_players())
+    how_text = (
+        "Тебя только что убили ночью."
+        if reason == "night"
+        else "Город только что проголосовал за твою казнь."
     )
+    role_goal = (
+        f"Оставь честное завещание мирным: скажи в 1-2 предложениях от лица «я», чьи СЛОВА или ГОЛОСА среди живых ({alive_names}) кажутся тебе самыми подозрительными и почему (не обвиняй в молчании!)."
+        if player.role == Role.CITIZEN
+        else f"Ты мафия, но игра в закрытую (твою роль НЕ знают!): притворись убранным мирным и в 1-2 предложениях тонко наведи подозрение на кого-то из живых мирных ({alive_names}) по их словам, не выдавая напарника."
+    )
+    return f"{context}\nПОСЛЕДНЕЕ СЛОВО ВЫБЫВШЕГО: {how_text} {role_goal} Только сама реплика:"
 
 
 def build_voting_task_prompt(player: Player, state: GameState, valid_targets: list[str]) -> str:
     context = build_table_state_block(player, state)
-    targets_str = ", ".join(valid_targets)
+    shuffled_targets = _shuffled_names(valid_targets, seed_key=player.seat * 23 + state.day * 11)
+    targets_str = ", ".join(shuffled_targets)
     return (
-        f"{context}\n\n"
-        f"ЗАДАНИЕ (Голосование игрока {player.name}):\n"
-        "Обсуждение окончено, началось открытое голосование на выбывание.\n"
-        f"Ты ОБЯЗАН(А) проголосовать ровно против ОДНОГО живого игрока из этого списка: [{targets_str}].\n"
-        "Голосовать против себя или выбывших нельзя.\n"
-        "Верни СТРОГО JSON:\n"
-        '{"thought": "почему мне выгодно проголосовать именно так", '
-        f'"target": "Точное_Имя_из_списка ({targets_str})", '
-        '"speech": "короткое обоснование голоса вслух (1 предложение на русском языке)"}'
+        f"{context}\n"
+        f"Голосование на выбывание. Выбери ОДНОГО самого подозрительного тебе ЖИВОГО соперника из [{targets_str}] по его словам и позиции (запрещено голосовать с причиной «молчит / мало говорит»!).\n"
+        "Ответь строго в 2 строки, называя в обеих строках ОДНО И ТО ЖЕ имя подозреваемого:\n"
+        "ПРИЧИНА: Я голосую против <Имя>, потому что <короткая причина по его словам/аргументам>\n"
+        "ГОЛОС: <То же самое Имя>"
     )
 
 
@@ -199,14 +293,10 @@ def build_night_suggest_prompt(player: Player, partner: Player, state: GameState
     context = build_table_state_block(player, state)
     targets_str = ", ".join(valid_targets)
     return (
-        f"{context}\n\n"
-        f"ЗАДАНИЕ (Ночное совещание мафии — {player.name} шепчет напарнику {partner.name}):\n"
-        "Город спит. Тебе нужно предложить напарнику одну жертву на эту ночь из списка живых мирных жителей: "
-        f"[{targets_str}]. Выбирай того, кто опасен для мафии или чья смерть запутает стол днём.\n"
-        "Верни СТРОГО JSON:\n"
-        '{"thought": "тактический расчёт выбора жертвы", '
-        f'"target": "Точное_Имя_из_списка ({targets_str})", '
-        '"speech": "короткая фраза шёпотом напарнику на русском языке (1 предложение: кого убираем и почему)"}'
+        f"{context}\n"
+        f"Ночь: предложи напарнику {partner.name} одну жертву из живых мирных [{targets_str}]. Строго 2 строки:\n"
+        "ПРИЧИНА: <1 короткая фраза напарнику с именем жертвы>\n"
+        "ЦЕЛЬ: <Точное имя этой жертвы>"
     )
 
 
@@ -214,13 +304,8 @@ def build_night_kill_prompt(player: Player, state: GameState, valid_targets: lis
     context = build_table_state_block(player, state)
     targets_str = ", ".join(valid_targets)
     return (
-        f"{context}\n\n"
-        f"ЗАДАНИЕ (Ночной выстрел мафии — решение принимает {player.name}):\n"
-        f"Город спит. Укажи финальную жертву ночного убийства мафии строго из списка живых мирных: [{targets_str}].\n"
-        "Учти предложение напарника, если оно было в ночном чате.\n"
-        "Верни СТРОГО JSON:\n"
-        '{"thought": "почему убираем именно этого игрока", '
-        f'"target": "Точное_Имя_из_списка ({targets_str})", '
-        '"speech": "короткая реплика шёпотом в ночной чат на русском языке (1 предложение)"}'
+        f"{context}\n"
+        f"Ночной выстрел мафии по одному из живых мирных [{targets_str}]. Строго 2 строки:\n"
+        "ПРИЧИНА: <1 короткая фраза почему убираем этого игрока>\n"
+        "ЦЕЛЬ: <Точное имя этой жертвы>"
     )
-

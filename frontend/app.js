@@ -4,6 +4,7 @@
   let selectedTarget = "";
   let showThoughts = false;
   let renderedMessageCount = 0;
+  let firstRenderedMessageId = null;
   let lastPhase = null;
 
   // Elements
@@ -32,7 +33,6 @@
   const winnerTitle = document.getElementById("winnerTitle");
   const winnerReason = document.getElementById("winnerReason");
   const revealTableBody = document.getElementById("revealTableBody");
-  const toggleThoughtsBtn = document.getElementById("toggleThoughtsBtn");
   const playAgainBtn = document.getElementById("playAgainBtn");
 
   const chatFeed = document.getElementById("chatFeed");
@@ -40,6 +40,8 @@
   const waitingStatusText = document.getElementById("waitingStatusText");
   const speakForm = document.getElementById("speakForm");
   const speakInput = document.getElementById("speakInput");
+  const speakSubmitBtn = document.getElementById("speakSubmitBtn");
+  const skipLastWordBtn = document.getElementById("skipLastWordBtn");
   const targetForm = document.getElementById("targetForm");
   const targetPromptLabel = document.getElementById("targetPromptLabel");
   const targetChips = document.getElementById("targetChips");
@@ -54,6 +56,8 @@
       const msg = JSON.parse(event.data);
       if (msg.type === "state") {
         handleStateUpdate(msg.state);
+      } else if (msg.type === "stream_chunk") {
+        renderStreamChunk(msg);
       } else if (msg.type === "health") {
         renderHealth(msg.health);
       } else if (msg.type === "error") {
@@ -135,9 +139,12 @@
   }
 
   function handleStateUpdate(state) {
+    const currentFirstId = state.messages.length > 0 ? state.messages[0].id : null;
     const isNewGameOrReset =
       !gameState ||
       state.messages.length < renderedMessageCount ||
+      (currentFirstId !== firstRenderedMessageId) ||
+      (!gameState.spectator_reveal && state.spectator_reveal) ||
       (lastPhase !== "game_over" && state.phase === "game_over");
 
     gameState = state;
@@ -154,6 +161,7 @@
       gameView.classList.add("hidden");
       renderPlayers([]);
       renderedMessageCount = 0;
+      firstRenderedMessageId = null;
       lastPhase = state.phase;
       return;
     }
@@ -209,18 +217,23 @@
       });
     }
 
+    const showAllRoles = Boolean(gameState.spectator_reveal || gameState.phase === "game_over");
+
     playerList.innerHTML = "";
     players.forEach((p) => {
+      const isVisibleActive =
+        gameState.active_speaker_seat === p.seat &&
+        (gameState.phase !== "night" || p.is_human);
       const li = document.createElement("li");
       li.className = "player-card";
       if (!p.is_alive) li.classList.add("dead");
-      if (gameState.active_speaker_seat === p.seat) li.classList.add("active-speaker");
+      if (isVisibleActive) li.classList.add("active-speaker");
 
       const tags = [];
       if (p.is_human) tags.push(`<span class="mini-tag tag-you">Вы</span>`);
-      if (p.role === "mafia" && (!p.is_human || gameState.phase === "game_over")) {
+      if (p.role === "mafia" && (!p.is_human || showAllRoles)) {
         tags.push(`<span class="mini-tag tag-mafia">Мафия</span>`);
-      } else if (p.role === "citizen" && gameState.phase === "game_over") {
+      } else if (p.role === "citizen" && showAllRoles) {
         tags.push(`<span class="mini-tag tag-citizen">Мирный</span>`);
       }
       if (voteCounts[p.name]) {
@@ -228,9 +241,11 @@
       }
 
       let statusText = "Жив";
-      if (!p.is_alive) {
+      if (!p.is_alive && isVisibleActive) {
+        statusText = p.is_human ? "Ваше последнее слово..." : "Последнее слово...";
+      } else if (!p.is_alive) {
         statusText = p.death_reason === "night" ? `Убит(а) ночью ${p.death_day}` : `Казнён(а) днём ${p.death_day}`;
-      } else if (gameState.active_speaker_seat === p.seat) {
+      } else if (isVisibleActive) {
         statusText = p.is_human ? "Ваш ход..." : "Думает...";
       }
 
@@ -244,8 +259,7 @@
           <div>${tags.join(" ")}</div>
         </div>
         <div class="player-sub">
-          <span class="${gameState.active_speaker_seat === p.seat ? "speaking-label" : ""}">${statusText}</span>
-          <span>${p.persona_title ? escapeHtml(p.persona_title) : ""}</span>
+          <span class="${isVisibleActive ? "speaking-label" : ""}">${statusText}</span>
         </div>
       `;
       playerList.appendChild(li);
@@ -255,8 +269,6 @@
   function renderGameOver(state) {
     if (state.phase !== "game_over") {
       gameOverCard.classList.add("hidden");
-      showThoughts = false;
-      toggleThoughtsBtn.textContent = "Показать скрытые мысли ИИ";
       return;
     }
 
@@ -275,22 +287,40 @@
         ? `Убит(а) ночью ${p.death_day}`
         : `Казнён(а) днём ${p.death_day}`;
 
-      const personaText = p.is_human
-        ? "Человек"
-        : `${escapeHtml(p.persona_title || "—")} — ${escapeHtml(p.persona_desc || "")}`;
-
       tr.innerHTML = `
         <td>#${p.seat}</td>
         <td><strong>${escapeHtml(p.name)}</strong> (${p.gender_ru})${p.is_human ? " · Вы" : ""}</td>
         <td><span class="mini-tag ${roleClass}">${escapeHtml(p.role_ru)}</span></td>
-        <td>${personaText}</td>
         <td>${fate}</td>
       `;
       revealTableBody.appendChild(tr);
     });
   }
 
+  function renderStreamChunk(chunk) {
+    let bubble = document.getElementById("liveStreamBubble");
+    if (!bubble) {
+      bubble = document.createElement("div");
+      bubble.id = "liveStreamBubble";
+      bubble.className = "msg-bubble msg-streaming";
+      chatFeed.appendChild(bubble);
+    }
+    const phaseTag = chunk.day === 0 ? "Знакомство · говорит..." : `День ${chunk.day} · говорит...`;
+    bubble.innerHTML = `
+      <div class="msg-header">
+        <span class="msg-author">${escapeHtml(chunk.sender_name)}</span>
+        <span class="msg-meta">${phaseTag}</span>
+      </div>
+      <div class="msg-text">${escapeHtml(chunk.text)}▌</div>
+    `;
+    chatFeed.scrollTop = chatFeed.scrollHeight;
+  }
+
   function renderMessages(state, forceFullRebuild) {
+    const existingStream = document.getElementById("liveStreamBubble");
+    if (existingStream) {
+      existingStream.remove();
+    }
     if (forceFullRebuild) {
       chatFeed.innerHTML = "";
       renderedMessageCount = 0;
@@ -338,6 +368,7 @@
 
     if (state.messages.length > renderedMessageCount) {
       renderedMessageCount = state.messages.length;
+      firstRenderedMessageId = state.messages[0].id;
       chatFeed.scrollTop = chatFeed.scrollHeight;
     }
   }
@@ -353,8 +384,14 @@
       return;
     }
 
-    if (state.waiting_for_human === "speak") {
+    if (state.waiting_for_human === "speak" || state.waiting_for_human === "last_word") {
+      const isLastWord = state.waiting_for_human === "last_word";
       speakForm.classList.remove("hidden");
+      speakInput.placeholder = isLastWord
+        ? "Ваше последнее слово городу перед выбыванием (после этого откроются все роли)..."
+        : "Ваша очередь говорить за столом...";
+      speakSubmitBtn.textContent = isLastWord ? "Оставить завещание" : "Сказать";
+      skipLastWordBtn.classList.toggle("hidden", !isLastWord);
       speakInput.focus();
       return;
     }
@@ -384,9 +421,12 @@
     waitingStatusLine.classList.remove("hidden");
     const activePlayer = state.players.find((p) => p.seat === state.active_speaker_seat);
     if (human && !human.is_alive) {
-      waitingStatusText.textContent = activePlayer
-        ? `Вы выбыли (режим наблюдателя) · Сейчас ходит ${activePlayer.name}...`
-        : "Вы выбыли (режим наблюдателя) · ИИ продолжают партию...";
+      waitingStatusText.textContent =
+        state.phase === "night"
+          ? "Вы выбыли (режим наблюдателя — все роли раскрыты) · Ночь: мафия выбирает жертву..."
+          : activePlayer
+          ? `Вы выбыли (режим наблюдателя — все роли раскрыты) · Сейчас ходит ${activePlayer.name}...`
+          : "Вы выбыли (режим наблюдателя — все роли раскрыты) · ИИ продолжают партию...";
     } else if (state.phase === "night") {
       waitingStatusText.textContent = "Город спит... Мафия выбирает жертву.";
     } else if (activePlayer) {
@@ -463,21 +503,19 @@
     sendAction({ action: "reset_lobby" });
   });
 
-  toggleThoughtsBtn.addEventListener("click", () => {
-    showThoughts = !showThoughts;
-    toggleThoughtsBtn.textContent = showThoughts
-      ? "Скрыть мысли ИИ"
-      : "Показать скрытые мысли ИИ";
-    if (gameState) {
-      renderMessages(gameState, true);
-    }
-  });
-
   speakForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (!gameState) return;
+    const mode = gameState.waiting_for_human === "last_word" ? "last_word" : "speak";
     const text = speakInput.value.trim();
-    if (!text) return;
-    sendAction({ action: "speak", text });
+    if (!text && mode === "speak") return;
+    sendAction({ action: mode, text });
+    speakInput.value = "";
+  });
+
+  skipLastWordBtn.addEventListener("click", () => {
+    if (!gameState || gameState.waiting_for_human !== "last_word") return;
+    sendAction({ action: "last_word", text: "" });
     speakInput.value = "";
   });
 

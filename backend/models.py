@@ -65,7 +65,7 @@ class Player:
     death_day: Optional[int] = None
 
     def to_public_dict(self, viewer: Optional[Player], reveal_all: bool = False) -> dict:
-        """Serialize player strictly isolating secret role & persona until game over."""
+        """Serialize player strictly isolating secret role until game over."""
         can_see_role = (
             reveal_all
             or (viewer is not None and viewer.seat == self.seat)
@@ -86,8 +86,6 @@ class Player:
             "death_day": self.death_day,
             "role": self.role.value if can_see_role else None,
             "role_ru": self.role.label_ru if can_see_role else "Неизвестно",
-            "persona_title": self.persona.title if (reveal_all and self.persona) else None,
-            "persona_desc": self.persona.short_desc if (reveal_all and self.persona) else None,
         }
 
 
@@ -142,7 +140,8 @@ class GameState:
     winner: Optional[Role] = None
     win_reason: Optional[str] = None
     active_speaker_seat: Optional[int] = None
-    waiting_for_human: Optional[str] = None  # None | "speak" | "vote" | "night_kill"
+    awaiting_last_word_seat: Optional[int] = None
+    waiting_for_human: Optional[str] = None  # None | "speak" | "last_word" | "vote" | "night_kill"
     valid_targets: list[str] = field(default_factory=list)
     mafia_suggestion: Optional[str] = None
     current_votes: dict[str, str] = field(default_factory=dict)
