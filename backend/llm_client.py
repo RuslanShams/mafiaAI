@@ -22,6 +22,7 @@ from backend.config import (
     PREDICT_TOKENS_DISCUSSION,
     PREDICT_TOKENS_INTRO,
     PREDICT_TOKENS_NIGHT,
+    PREDICT_TOKENS_NIGHT_TARGET,
     PREDICT_TOKENS_VOTE,
 )
 from backend.models import Gender, Player, Role
@@ -60,7 +61,7 @@ SPEECH_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 EXPLICIT_VOTE_PHRASE_RE = re.compile(
-    r"(?:голо[св]у[юем]+\s+(?:против|за)|мой\s+голос\s*(?:[:\-—]|против|за)?|убира[юем]+)\s+([А-ЯЁа-яё]{3,16})",
+    r"(?:голо[св]у[юем]+\s+(?:против|за|на\s+выбывание(?:\s+игрока)?)|на\s+выбывание(?:\s+игрока)?|мой\s+голос\s*(?:[:\-—]|против|за)?|убира[юем]+)\s+([А-ЯЁа-яё]{3,16})",
     re.IGNORECASE,
 )
 
@@ -374,6 +375,8 @@ def _predict_budget_for_kind(kind: str) -> int:
         return PREDICT_TOKENS_VOTE
     if kind == "night":
         return PREDICT_TOKENS_NIGHT
+    if kind == "night_target":
+        return PREDICT_TOKENS_NIGHT_TARGET
     return PREDICT_TOKENS_DISCUSSION
 
 
@@ -574,37 +577,55 @@ class OllamaClient:
                     matched_target, raw_speech = parse_target_and_speech(
                         raw_content, valid_targets, speaker_name=player.name
                     )
-                    speech = soft_sanitize_speech(
-                        raw_speech, speaker_name=player.name, allowed_names=allowed_names
-                    )
-                    if not speech or len(speech) < 4:
-                        speech = (
-                            f"Голосую против {matched_target}."
-                            if fallback_kind == "vote" and matched_target
-                            else f"Убираем {matched_target}."
-                        )
-                    err = validate_russian_speech(
-                        speech,
-                        player=player,
-                        is_public_day=is_public_day,
-                        allowed_names=allowed_names,
-                        dead_names=dead_names,
-                        unspoken_names=unspoken_names,
-                    )
-                    if err:
-                        last_error = err
-                    elif not matched_target:
+                    # Fast target-only mode for AI Doctor / Commissar night actions (no speech needed!)
+                    if fallback_kind == "night_target":
+                        if matched_target:
+                            elapsed = time.monotonic() - t_start
+                            logger.info(
+                                "%s (%s) completed night_target in %.2fs -> %s",
+                                player.name,
+                                self.model,
+                                elapsed,
+                                matched_target,
+                            )
+                            return {
+                                "thought": f"Ночной выбор: {matched_target} ({elapsed:.1f} с)",
+                                "speech": "",
+                                "target": matched_target,
+                            }
                         last_error = f"Цель не распознана из списка: {', '.join(valid_targets)}."
                     else:
-                        elapsed = time.monotonic() - t_start
-                        logger.info(
-                            "%s (%s) completed %s in %.2fs", player.name, self.model, fallback_kind, elapsed
+                        speech = soft_sanitize_speech(
+                            raw_speech, speaker_name=player.name, allowed_names=allowed_names
                         )
-                        return {
-                            "thought": f"Выбор цели: {matched_target} ({elapsed:.1f} с)",
-                            "speech": speech,
-                            "target": matched_target,
-                        }
+                        if not speech or len(speech) < 4:
+                            speech = (
+                                f"Голосую против {matched_target}."
+                                if fallback_kind == "vote" and matched_target
+                                else f"Убираем {matched_target}."
+                            )
+                        err = validate_russian_speech(
+                            speech,
+                            player=player,
+                            is_public_day=is_public_day,
+                            allowed_names=allowed_names,
+                            dead_names=dead_names,
+                            unspoken_names=unspoken_names,
+                        )
+                        if err:
+                            last_error = err
+                        elif not matched_target:
+                            last_error = f"Цель не распознана из списка: {', '.join(valid_targets)}."
+                        else:
+                            elapsed = time.monotonic() - t_start
+                            logger.info(
+                                "%s (%s) completed %s in %.2fs", player.name, self.model, fallback_kind, elapsed
+                            )
+                            return {
+                                "thought": f"Выбор цели: {matched_target} ({elapsed:.1f} с)",
+                                "speech": speech,
+                                "target": matched_target,
+                            }
                 else:
                     speech = soft_sanitize_speech(
                         raw_content, speaker_name=player.name, allowed_names=allowed_names

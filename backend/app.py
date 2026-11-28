@@ -125,7 +125,7 @@ async def ws_game(websocket: WebSocket) -> None:
             elif action == "reset_lobby":
                 await game_engine.reset_to_lobby()
 
-            elif action in ("speak", "last_word", "vote", "night_kill"):
+            elif action in ("speak", "last_word", "vote", "night_kill", "night_heal", "night_check"):
                 ok = game_engine.submit_human_input(
                     action_type=action,
                     text=str(data.get("text", "")),

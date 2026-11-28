@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Мафия AI — Настольная игра (Ollama)</title>
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=8" />
 </head>
 <body>
   <div class="app-shell" id="appShell">
@@ -18,6 +18,7 @@
       <div class="status-group">
         <div class="badge" id="phaseBadge">Лобби</div>
         <div class="badge role-badge hidden" id="roleBadge">Роль: —</div>
+        <div class="badge muted-badge hidden" id="aliveCountLabel">7 / 7 живы</div>
       </div>
 
       <div class="right-controls">
@@ -31,33 +32,15 @@
       </div>
     </header>
 
-    <!-- Main Layout -->
-    <main class="workspace">
-      <!-- Left Sidebar: Players around the table -->
-      <aside class="sidebar">
-        <div class="panel-header">
-          <span>ИГРОКИ ЗА СТОЛОМ</span>
-          <span class="count-label" id="aliveCountLabel">7 / 7</span>
-        </div>
-        <ul class="player-list" id="playerList">
-          <li class="empty-seats">Места распределятся в начале партии</li>
-        </ul>
-        <div class="rules-mini">
-          <div>• 7 игроков: 5 мирных, 2 мафии</div>
-          <div>• Первая ночь — без убийства</div>
-          <div>• Игра <strong>в закрытую</strong> (роли скрыты до финала)</div>
-          <div>• День: 2 круга речей → голосование</div>
-        </div>
-      </aside>
-
-      <!-- Center Feed + Lobby / End Screen + Action Panel -->
-      <section class="stage">
-        <!-- Lobby View -->
-        <div class="lobby-card" id="lobbyView">
+    <!-- Main Workspace -->
+    <main class="workspace" id="workspace">
+      <!-- Lobby View (centered when phase === lobby) -->
+      <section class="lobby-stage" id="lobbyView">
+        <div class="lobby-card">
           <h2>Новая партия за столом</h2>
           <p class="subtitle">
             Вы играете против 6 ИИ-соперников на базе локальной модели Ollama (<code id="lobbyModelCode">gemma3:4b</code>).
-            Роли, места, пол и имена ИИ распределяются случайно в каждой новой игре.
+            7 игроков: 2 мафии, комиссар, доктор и 3 мирных. Первая ночь без убийства, игра в закрытую.
           </p>
 
           <div class="alert-box hidden" id="ollamaWarning"></div>
@@ -71,7 +54,7 @@
                 </button>
               </div>
               <select id="modelSelect" required>
-                <option value="qwen2.5:7b">Загрузка моделей из Ollama...</option>
+                <option value="gemma3:4b">Загрузка моделей из Ollama...</option>
               </select>
             </div>
 
@@ -82,7 +65,7 @@
                 id="playerNameInput"
                 maxlength="20"
                 value="Игрок"
-                placeholder="Например, Артём"
+                placeholder="Например, Руслан"
                 required
               />
             </div>
@@ -102,14 +85,17 @@
             </div>
 
             <button type="submit" class="btn btn-primary btn-lg" id="startGameBtn">
-              Раздать карты и начать игру
+              Раздать карты и сесть за стол
             </button>
           </form>
         </div>
+      </section>
 
-        <!-- Game Feed View -->
-        <div class="feed-container hidden" id="gameView">
-          <!-- Game Over Banner (revealed when phase === game_over) -->
+      <!-- Active Game Arena: Visual Table + Side Chronicle -->
+      <section class="game-layout hidden" id="gameView">
+        <!-- Left/Main: Visual Tabletop + Action Bar -->
+        <div class="table-column">
+          <!-- Game Over Banner (appears above table when game ends) -->
           <div class="gameover-card hidden" id="gameOverCard">
             <div class="gameover-header">
               <div>
@@ -138,12 +124,27 @@
             </div>
           </div>
 
-          <!-- Chat / Log Stream -->
-          <div class="chat-feed" id="chatFeed"></div>
+          <!-- Visual Mafia Tabletop Scene -->
+          <div class="table-arena" id="tableArena">
+            <div class="room-spotlight"></div>
+
+            <!-- The Oval Tabletop -->
+            <div class="mafia-table">
+              <div class="table-felt">
+                <div class="table-emblem" id="tableEmblem">
+                  <div class="emblem-icon" id="tableIcon">☀</div>
+                  <div class="emblem-phase" id="tablePhaseTitle">День 1</div>
+                  <div class="emblem-narrator" id="tableNarratorText">Стол готов к обсуждению</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 7 Seats around the table (rendered dynamically by app.js) -->
+            <div class="seats-layer" id="seatsLayer"></div>
+          </div>
 
           <!-- Bottom Human Action Bar -->
           <div class="action-bar" id="actionBar">
-            <!-- Idle / AI Thinking status -->
             <div class="status-line" id="waitingStatusLine">
               <span class="pulse-indicator"></span>
               <span id="waitingStatusText">Ожидание начала хода...</span>
@@ -181,11 +182,23 @@
             </form>
           </div>
         </div>
+
+        <!-- Right Column: Scrollable Chronicle / History -->
+        <aside class="chronicle-sidebar">
+          <div class="panel-header">
+            <span>ХРОНИКА СТОЛА</span>
+            <span class="muted">История реплик</span>
+          </div>
+          <div class="chat-feed" id="chatFeed"></div>
+          <div class="rules-mini">
+            <div>• 7 игроков: 2 мафии, комиссар, доктор, 3 мирных</div>
+            <div>• Первая ночь без убийства · Игра <strong>в закрытую</strong></div>
+          </div>
+        </aside>
       </section>
     </main>
   </div>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>
-

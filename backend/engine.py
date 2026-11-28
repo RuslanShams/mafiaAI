@@ -20,7 +20,10 @@ from backend.models import (
 )
 from backend.personas import generate_ai_profiles
 from backend.prompts import (
+    _find_public_commissar_claims,
+    build_commissar_check_prompt,
     build_discussion_task_prompt,
+    build_doctor_heal_prompt,
     build_last_word_prompt,
     build_night_kill_prompt,
     build_night_suggest_prompt,
@@ -160,6 +163,10 @@ class GameEngine:
                 visible_messages.append(msg.to_client_dict(include_thought=False))
             elif msg.visibility == "mafia" and human and human.role == Role.MAFIA:
                 visible_messages.append(msg.to_client_dict(include_thought=False))
+            elif msg.visibility == "commissar" and human and human.role == Role.COMMISSAR:
+                visible_messages.append(msg.to_client_dict(include_thought=False))
+            elif msg.visibility == "doctor" and human and human.role == Role.DOCTOR:
+                visible_messages.append(msg.to_client_dict(include_thought=False))
 
         return {
             "phase": self.state.phase.value,
@@ -197,8 +204,12 @@ class GameEngine:
         clean_name = (human_name or "Игрок").strip()[:20] or "Игрок"
         h_gender = Gender.FEMALE if human_gender == "F" else Gender.MALE
 
-        # Randomize roles: 2 Mafia, 5 Citizens across 7 seats
-        roles = [Role.MAFIA] * MAFIA_COUNT + [Role.CITIZEN] * (TOTAL_PLAYERS - MAFIA_COUNT)
+        # Randomize roles: 2 Mafia, 1 Commissar, 1 Doctor, 3 Citizens across 7 seats
+        roles = (
+            [Role.MAFIA] * MAFIA_COUNT
+            + [Role.COMMISSAR, Role.DOCTOR]
+            + [Role.CITIZEN] * (TOTAL_PLAYERS - MAFIA_COUNT - 2)
+        )
         random.shuffle(roles)
 
         # Randomize which seat (1..7) the human occupies so turn order varies naturally
@@ -249,7 +260,7 @@ class GameEngine:
                 partner_info = f" Ваш напарник по мафии — {partners[0]}."
 
         self._add_system_message(
-            f"Партия началась! За столом 7 игроков: 5 мирных жителей и 2 мафии (модель ИИ: {self.llm.model}). "
+            f"Партия началась! За столом 7 игроков: 2 мафии, 1 комиссар, 1 доктор и 3 мирных (модель ИИ: {self.llm.model}). "
             "Игра идёт в закрытую, а в первую ночь мафия никого не убивает."
         )
         if human:
@@ -274,7 +285,7 @@ class GameEngine:
         elif action_type == "last_word":
             # Empty text is allowed if human clicks "Skip last word"
             self._human_payload = {"text": text.strip()[:500]}
-        elif action_type in ("vote", "night_kill"):
+        elif action_type in ("vote", "night_kill", "night_heal", "night_check"):
             if target not in self.state.valid_targets:
                 return False
             self._human_payload = {"target": target, "text": text.strip()[:250]}
@@ -545,22 +556,104 @@ class GameEngine:
         self.state.active_speaker_seat = None
         self.state.mafia_suggestion = None
 
+        # 2. Doctor night action (cannot heal the same player two nights in a row)
+        healed_player: Optional[Player] = None
+        doctor = self.state.alive_role(Role.DOCTOR)
+        if doctor:
+            heal_candidates = [
+                p.name
+                for p in self.state.alive_players()
+                if p.seat != self.state.last_doctor_heal_seat
+            ]
+            if not heal_candidates:
+                heal_candidates = [p.name for p in self.state.alive_players()]
+            if doctor.is_human:
+                self.state.active_speaker_seat = doctor.seat
+                payload = await self._wait_for_human("night_heal", valid_targets=heal_candidates)
+                healed_name = payload["target"]
+            else:
+                res_doc = await self._ai_generate(
+                    player=doctor,
+                    system_prompt=build_system_prompt(doctor, self.state),
+                    user_prompt=build_doctor_heal_prompt(doctor, self.state, heal_candidates),
+                    valid_targets=heal_candidates,
+                    is_public_day=False,
+                    fallback_kind="night_target",
+                )
+                healed_name = res_doc["target"]
+            healed_player = self.state.find_by_name(healed_name or "")
+            if healed_player:
+                self.state.last_doctor_heal_seat = healed_player.seat
+                self._add_Message_direct(
+                    sender_seat=doctor.seat,
+                    sender_name=f"{doctor.name} (Доктор)",
+                    text=f"Ночное лечение: под защитой на эту ночь {healed_player.name}.",
+                    visibility="doctor",
+                )
+            self.state.active_speaker_seat = None
+
+        # 3. Commissar night action (checks one alive unchecked player)
+        commissar = self.state.alive_role(Role.COMMISSAR)
+        if commissar:
+            check_candidates = [
+                p.name
+                for p in self.state.alive_players()
+                if p.seat != commissar.seat and p.name not in self.state.commissar_checks
+            ]
+            if not check_candidates:
+                check_candidates = [p.name for p in self.state.alive_players() if p.seat != commissar.seat]
+            if check_candidates:
+                if commissar.is_human:
+                    self.state.active_speaker_seat = commissar.seat
+                    payload = await self._wait_for_human("night_check", valid_targets=check_candidates)
+                    checked_name = payload["target"]
+                else:
+                    res_com = await self._ai_generate(
+                        player=commissar,
+                        system_prompt=build_system_prompt(commissar, self.state),
+                        user_prompt=build_commissar_check_prompt(commissar, self.state, check_candidates),
+                        valid_targets=check_candidates,
+                        is_public_day=False,
+                        fallback_kind="night_target",
+                    )
+                    checked_name = res_com["target"]
+                checked_player = self.state.find_by_name(checked_name or "")
+                if checked_player:
+                    verdict = "Мафия" if checked_player.role == Role.MAFIA else "Мирный"
+                    self.state.commissar_checks[checked_player.name] = verdict
+                    self._add_Message_direct(
+                        sender_seat=commissar.seat,
+                        sender_name=f"{commissar.name} (Комиссар)",
+                        text=f"Результат проверки: {checked_player.name} — {verdict}!",
+                        visibility="commissar",
+                    )
+                self.state.active_speaker_seat = None
+
+        # 4. Resolve night kill vs Doctor's save
         victim = self.state.find_by_name(chosen_target_name or "")
         if victim and victim.is_alive:
-            victim.is_alive = False
-            victim.death_reason = "night"
-            victim.death_day = self.state.day
-            day_rec.night_victim = victim.name
-            killed_verb = "убит" if victim.gender == Gender.MALE else "убита"
-            self._add_system_message(
-                f"Наступает утро Дня {self.state.day}. Этой ночью {killed_verb} {victim.name}. "
-                "По правилам закрытой игры роль не раскрывается."
-            )
-            if not self._is_victory_reached():
-                self.state.awaiting_last_word_seat = victim.seat
-                await self._run_last_word(victim, reason="night")
-            else:
+            if healed_player and healed_player.seat == victim.seat:
+                day_rec.night_saved = True
+                self._add_system_message(
+                    f"Наступает утро Дня {self.state.day}. Этой ночью мафия стреляла, "
+                    "но Доктор вовремя спас жертву — все игроки остались живы!"
+                )
                 await self.push_state()
+            else:
+                victim.is_alive = False
+                victim.death_reason = "night"
+                victim.death_day = self.state.day
+                day_rec.night_victim = victim.name
+                killed_verb = "убит" if victim.gender == Gender.MALE else "убита"
+                self._add_system_message(
+                    f"Наступает утро Дня {self.state.day}. Этой ночью {killed_verb} {victim.name}. "
+                    "По правилам закрытой игры роль не раскрывается."
+                )
+                if not self._is_victory_reached():
+                    self.state.awaiting_last_word_seat = victim.seat
+                    await self._run_last_word(victim, reason="night")
+                else:
+                    await self.push_state()
         else:
             await self.push_state()
 
@@ -645,13 +738,46 @@ class GameEngine:
                     vote_target=target_name,
                 )
             else:
+                ai_vote_targets = list(valid_targets)
+                # AI Commissar NEVER ignores known Mafia or votes out verified Citizens!
+                if player.role == Role.COMMISSAR and self.state.commissar_checks:
+                    known_mafia = [
+                        t for t in ai_vote_targets if self.state.commissar_checks.get(t) == "Мафия"
+                    ]
+                    if known_mafia:
+                        ai_vote_targets = known_mafia
+                    else:
+                        unchecked_or_susp = [
+                            t for t in ai_vote_targets if self.state.commissar_checks.get(t) != "Мирный"
+                        ]
+                        if unchecked_or_susp:
+                            ai_vote_targets = unchecked_or_susp
+                # AI Mafia avoids voting against its own alive Mafia partner when Town targets exist
+                elif player.role == Role.MAFIA:
+                    non_mafia_targets = [
+                        p.name
+                        for p in self.state.alive_players()
+                        if p.seat != player.seat and p.role != Role.MAFIA
+                    ]
+                    if non_mafia_targets:
+                        ai_vote_targets = non_mafia_targets
+                # Town AI does not vote to execute the sole uncontested revealed Commissar!
+                elif player.role.is_town:
+                    alive_claims = [
+                        n for n, _txt, alive in _find_public_commissar_claims(self.state) if alive
+                    ]
+                    if len(alive_claims) == 1:
+                        without_sole_com = [t for t in ai_vote_targets if t != alive_claims[0]]
+                        if without_sole_com:
+                            ai_vote_targets = without_sole_com
+
                 sys_prompt = build_system_prompt(player, self.state)
-                user_prompt = build_voting_task_prompt(player, self.state, valid_targets)
+                user_prompt = build_voting_task_prompt(player, self.state, ai_vote_targets)
                 res = await self._ai_generate(
                     player=player,
                     system_prompt=sys_prompt,
                     user_prompt=user_prompt,
-                    valid_targets=valid_targets,
+                    valid_targets=ai_vote_targets,
                     is_public_day=True,
                     fallback_kind="vote",
                 )

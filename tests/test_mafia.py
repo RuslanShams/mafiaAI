@@ -18,8 +18,10 @@ from backend.models import ChatMessage, GameState, Gender, Phase, Player, Role
 from backend.personas import generate_ai_profiles
 from backend.prompts import (
     build_discussion_task_prompt,
+    build_doctor_heal_prompt,
     build_system_prompt,
     build_table_state_block,
+    build_voting_task_prompt,
     find_direct_mentions_for_player,
 )
 
@@ -63,10 +65,18 @@ class FakeOllamaClient:
             assert "ТВОЯ СЕКРЕТНАЯ РОЛЬ: МИРНЫЙ ЖИТЕЛЬ" in full_prompt
             assert "СЕКРЕТНЫЙ НОЧНОЙ ЧАТ МАФИИ" not in full_prompt
             assert "Твой напарник по мафии:" not in full_prompt
+        elif player.role == Role.COMMISSAR:
+            assert "ТВОЯ СЕКРЕТНАЯ РОЛЬ: КОМИССАР" in full_prompt
+            assert "СЕКРЕТНЫЙ НОЧНОЙ ЧАТ МАФИИ" not in full_prompt
+        elif player.role == Role.DOCTOR:
+            assert "ТВОЯ СЕКРЕТНАЯ РОЛЬ: ДОКТОР" in full_prompt
+            assert "СЕКРЕТНЫЙ НОЧНОЙ ЧАТ МАФИИ" not in full_prompt
         else:
             assert "ТВОЯ СЕКРЕТНАЯ РОЛЬ: МАФИЯ" in full_prompt
 
         target = valid_targets[0] if valid_targets else ""
+        if fallback_kind == "night_target":
+            return {"thought": "Ночной выбор", "speech": "", "target": target}
         speech = (
             "Давайте спокойно послушаем всех за столом."
             if not target
@@ -284,6 +294,10 @@ class MafiaGameTests(unittest.TestCase):
             await engine.start_new_game(human_name="Руслан", human_gender="M", ai_model="gemma3:4b")
             self.assertEqual(engine.state.ai_model, "gemma3:4b")
             self.assertEqual(len(engine.state.players), 7)
+            self.assertEqual(sum(1 for p in engine.state.players if p.role == Role.MAFIA), 2)
+            self.assertEqual(sum(1 for p in engine.state.players if p.role == Role.COMMISSAR), 1)
+            self.assertEqual(sum(1 for p in engine.state.players if p.role == Role.DOCTOR), 1)
+            self.assertEqual(sum(1 for p in engine.state.players if p.role == Role.CITIZEN), 3)
 
             checked_day1_all_alive = False
             steps = 0
@@ -305,7 +319,7 @@ class MafiaGameTests(unittest.TestCase):
                     if engine.state.phase == Phase.NIGHT and engine.state.active_speaker_seat != human.seat:
                         self.assertIsNone(snap["active_speaker_seat"])
                     for pd in snap["players"]:
-                        if human.is_alive and human.role == Role.CITIZEN and not pd["is_human"]:
+                        if human.is_alive and human.role.is_town and not pd["is_human"]:
                             self.assertIsNone(pd["role"])
                             self.assertEqual(pd["role_ru"], "Неизвестно")
                         # If human is dead and finished Last Word, ALL roles MUST be visible to human spectator!
@@ -316,23 +330,26 @@ class MafiaGameTests(unittest.TestCase):
                 if mode == "speak":
                     engine.submit_human_input("speak", text="Я мирный, давайте смотреть по голосам.")
                 elif mode == "last_word":
-                    # Before submitting last_word, roles must still be hidden for Citizen human
+                    # Before submitting last_word, roles must still be hidden for Town human
                     human = engine.state.human_player()
-                    if human and human.role == Role.CITIZEN:
+                    if human and human.role.is_town:
                         pre_snap = engine.serialize_for_human()
                         others = [x for x in pre_snap["players"] if not x["is_human"]]
                         self.assertTrue(all(x["role"] is None for x in others))
-                    engine.submit_human_input("last_word", text="Город, присмотритесь к молчунам!")
-                elif mode in ("vote", "night_kill"):
+                    engine.submit_human_input("last_word", text="Город, присмотритесь к аргументам!")
+                elif mode in ("vote", "night_kill", "night_heal", "night_check"):
                     target = engine.state.valid_targets[0]
-                    engine.submit_human_input(mode, target=target, text=f"Голосую против {target}.")
+                    engine.submit_human_input(mode, target=target, text=f"Выбираю {target}.")
 
             self.assertTrue(checked_day1_all_alive)
             self.assertEqual(engine.state.phase, Phase.GAME_OVER)
             self.assertIn(engine.state.winner, (Role.CITIZEN, Role.MAFIA))
-            # Night 2 MUST have a victim if game reached Day 2
+            # Night 2 MUST either have a victim OR a Doctor save if game reached Day 2
             if len(engine.state.history) >= 2:
-                self.assertIsNotNone(engine.state.history[1].night_victim)
+                self.assertTrue(
+                    engine.state.history[1].night_victim is not None
+                    or engine.state.history[1].night_saved
+                )
 
             final_snap = engine.serialize_for_human()
             for pd in final_snap["players"]:
@@ -345,6 +362,46 @@ class MafiaGameTests(unittest.TestCase):
             self.assertIn("ИГРА В ЗАКРЫТУЮ", sys_block)
 
         asyncio.run(run_sim())
+
+    def test_commissar_uses_mafia_check_and_town_reacts_to_reveal(self) -> None:
+        players = [
+            Player(1, "Ольга", Gender.FEMALE, False, Role.MAFIA),
+            Player(2, "Анна", Gender.FEMALE, False, Role.CITIZEN),
+            Player(3, "Полина", Gender.FEMALE, False, Role.DOCTOR),
+            Player(4, "Сергей", Gender.MALE, False, Role.COMMISSAR),
+            Player(5, "Татьяна", Gender.FEMALE, False, Role.MAFIA),
+            Player(6, "Руслан", Gender.MALE, True, Role.CITIZEN, is_alive=False, death_reason="night", death_day=2),
+            Player(7, "Дмитрий", Gender.MALE, False, Role.CITIZEN, is_alive=False, death_reason="vote", death_day=1),
+        ]
+        state = GameState(
+            phase=Phase.DAY_DISCUSSION,
+            day=2,
+            round_num=1,
+            players=players,
+            commissar_checks={"Ольга": "Мафия"},
+        )
+        # Even if Polina argued with Sergey, Sergey (Commissar) MUST prioritize revealing Olga = Mafia on 5-player table!
+        state.messages.append(
+            ChatMessage("1", 2, Phase.DAY_DISCUSSION, 1, 3, "Полина", "Сергей, ты пытаешься меня запутать!", "public")
+        )
+        sergey = players[3]
+        disc_prompt = build_discussion_task_prompt(sergey, state)
+        self.assertIn("ВАЖНЕЙШИЙ ХОД КОМИССАРА", disc_prompt)
+        self.assertIn("Ольга — МАФИЯ", disc_prompt)
+
+        vote_prompt = build_voting_task_prompt(sergey, state, ["Ольга"])
+        self.assertIn("ГОЛОС: Ольга", vote_prompt)
+
+        # Once Sergey publicly reveals as Commissar, Town & Doctor prompts recognize his uncontested claim!
+        state.messages.append(
+            ChatMessage("2", 2, Phase.DAY_DISCUSSION, 1, 4, "Сергей", "Я Комиссар! Ночью я проверил Ольгу — она мафия!", "public")
+        )
+        polina = players[2]
+        polina_vote_prompt = build_voting_task_prompt(polina, state, ["Ольга", "Анна", "Сергей", "Татьяна"])
+        self.assertIn("единственный вскрывшийся Комиссар", polina_vote_prompt)
+
+        doc_night_prompt = build_doctor_heal_prompt(polina, state, ["Ольга", "Анна", "Полина", "Сергей", "Татьяна"])
+        self.assertIn("Сергей вскрылся Комиссаром", doc_night_prompt)
 
     def test_http_and_websocket_endpoints(self) -> None:
         client = TestClient(app)

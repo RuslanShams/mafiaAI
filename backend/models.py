@@ -8,10 +8,22 @@ from typing import Optional
 class Role(str, Enum):
     CITIZEN = "citizen"
     MAFIA = "mafia"
+    COMMISSAR = "commissar"
+    DOCTOR = "doctor"
 
     @property
     def label_ru(self) -> str:
-        return "Мафия" if self == Role.MAFIA else "Мирный житель"
+        labels = {
+            Role.CITIZEN: "Мирный житель",
+            Role.MAFIA: "Мафия",
+            Role.COMMISSAR: "Комиссар",
+            Role.DOCTOR: "Доктор",
+        }
+        return labels[self]
+
+    @property
+    def is_town(self) -> bool:
+        return self != Role.MAFIA
 
 
 class Gender(str, Enum):
@@ -123,6 +135,7 @@ class ChatMessage:
 class DayRecord:
     day: int
     night_victim: Optional[str] = None
+    night_saved: bool = False
     votes: dict[str, str] = field(default_factory=dict)  # voter_name -> target_name
     executed: Optional[str] = None
     tie_no_execution: bool = False
@@ -141,10 +154,12 @@ class GameState:
     win_reason: Optional[str] = None
     active_speaker_seat: Optional[int] = None
     awaiting_last_word_seat: Optional[int] = None
-    waiting_for_human: Optional[str] = None  # None | "speak" | "last_word" | "vote" | "night_kill"
+    waiting_for_human: Optional[str] = None  # None | "speak" | "last_word" | "vote" | "night_kill" | "night_heal" | "night_check"
     valid_targets: list[str] = field(default_factory=list)
     mafia_suggestion: Optional[str] = None
     current_votes: dict[str, str] = field(default_factory=dict)
+    commissar_checks: dict[str, str] = field(default_factory=dict)  # target_name -> "Мафия" | "Мирный"
+    last_doctor_heal_seat: Optional[int] = None
 
     def human_player(self) -> Optional[Player]:
         for p in self.players:
@@ -159,7 +174,14 @@ class GameState:
         return [p for p in self.players if p.is_alive and p.role == Role.MAFIA]
 
     def alive_citizens(self) -> list[Player]:
-        return [p for p in self.players if p.is_alive and p.role == Role.CITIZEN]
+        """All alive Town-aligned players (Citizens + Commissar + Doctor)."""
+        return [p for p in self.players if p.is_alive and p.role.is_town]
+
+    def alive_role(self, role: Role) -> Optional[Player]:
+        for p in self.players:
+            if p.is_alive and p.role == role:
+                return p
+        return None
 
     def find_by_name(self, name: str) -> Optional[Player]:
         clean = name.strip().lower()
