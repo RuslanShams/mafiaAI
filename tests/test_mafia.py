@@ -24,6 +24,7 @@ from backend.prompts import (
     build_voting_task_prompt,
     find_direct_mentions_for_player,
 )
+from backend.session_manager import SessionManager
 
 
 class FakeOllamaClient:
@@ -49,6 +50,7 @@ class FakeOllamaClient:
         dead_names: Optional[list[str]] = None,
         unspoken_names: Optional[list[str]] = None,
         on_stream_text=None,
+        model: Optional[str] = None,
     ) -> dict[str, str]:
         self.calls.append(
             {
@@ -403,6 +405,67 @@ class MafiaGameTests(unittest.TestCase):
         doc_night_prompt = build_doctor_heal_prompt(polina, state, ["Ольга", "Анна", "Полина", "Сергей", "Татьяна"])
         self.assertIn("Сергей вскрылся Комиссаром", doc_night_prompt)
 
+    def test_multi_session_isolation_and_max_4_limit(self) -> None:
+        async def run_multi() -> None:
+            fake_llm = FakeOllamaClient()
+            mgr = SessionManager(llm=fake_llm, max_sessions=4)  # type: ignore[arg-type]
+
+            sessions = [mgr.get_or_create(f"session_num_{i}") for i in range(1, 6)]
+            # Start 4 independent games simultaneously
+            for i in range(4):
+                ok, err = await mgr.can_start_game(sessions[i])
+                self.assertTrue(ok, err)
+                await sessions[i].engine.start_new_game(
+                    human_name=f"Игрок{i+1}", human_gender="M", ai_model="gemma3:12b"
+                )
+
+            self.assertEqual(mgr.slots_summary()["active_games"], 4)
+            self.assertEqual(mgr.slots_summary()["free_slots"], 0)
+
+            # Verify sessions do not leak players into one another
+            names_s1 = {p.name for p in sessions[0].engine.state.players if p.is_human}
+            names_s2 = {p.name for p in sessions[1].engine.state.players if p.is_human}
+            self.assertEqual(names_s1, {"Игрок1"})
+            self.assertEqual(names_s2, {"Игрок2"})
+
+            # 5th concurrent game must be rejected while 4 tables are playing
+            ok5, err5 = await mgr.can_start_game(sessions[4])
+            self.assertFalse(ok5)
+            self.assertIn("4", err5 or "")
+
+            # Once session 1 resets to lobby, a slot frees up and session 5 can start
+            await sessions[0].engine.reset_to_lobby()
+            self.assertEqual(mgr.slots_summary()["active_games"], 3)
+            ok5_after, _ = await mgr.can_start_game(sessions[4])
+            self.assertTrue(ok5_after)
+
+            await mgr.shutdown_all()
+
+        asyncio.run(run_multi())
+
+    def test_speech_pacing_delay_calculation(self) -> None:
+        async def noop(_msg: dict) -> None:
+            return None
+
+        fake_llm = FakeOllamaClient()
+        paced_engine = GameEngine(llm=fake_llm, broadcast=noop, spectator_delay=0.8)  # type: ignore[arg-type]
+        unpaced_engine = GameEngine(llm=fake_llm, broadcast=noop, spectator_delay=0.0)  # type: ignore[arg-type]
+
+        sample_speech = "А" * 110  # ~5.0s typing at 22 chars/sec + 2.2s reading hold = ~7.2s
+        self.assertEqual(unpaced_engine._compute_speech_pace_delay(sample_speech), 0.0)
+
+        # Fast GPU generation (0.5s elapsed since first streamed token): waits remaining ~4.5s + 2.2s hold
+        gpu_delay = paced_engine._compute_speech_pace_delay(
+            sample_speech, stream_started_at=100.0, now=100.5
+        )
+        self.assertGreater(gpu_delay, 6.0)
+
+        # Slow CPU generation (9.0s elapsed since first streamed token): typing already done, waits only reading hold
+        cpu_delay = paced_engine._compute_speech_pace_delay(
+            sample_speech, stream_started_at=100.0, now=109.0
+        )
+        self.assertAlmostEqual(cpu_delay, 2.2, places=1)
+
     def test_http_and_websocket_endpoints(self) -> None:
         client = TestClient(app)
         res = client.get("/")
@@ -414,7 +477,11 @@ class MafiaGameTests(unittest.TestCase):
         self.assertIn("last_word", js_res.text)
         self.assertIn("no-store", js_res.headers.get("cache-control", ""))
 
-        with client.websocket_connect("/ws/game") as ws:
+        with client.websocket_connect("/ws/game?session_id=test_client_01") as ws:
+            sess_msg = ws.receive_json()
+            self.assertEqual(sess_msg["type"], "session")
+            self.assertEqual(sess_msg["session_id"], "test_client_01")
+            self.assertEqual(sess_msg["slots"]["max_sessions"], 4)
             first = ws.receive_json()
             self.assertEqual(first["type"], "state")
             self.assertEqual(first["state"]["phase"], "lobby")

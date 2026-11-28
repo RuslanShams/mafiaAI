@@ -3,11 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import uuid
 from collections import Counter
 from typing import Awaitable, Callable, Optional
 
-from backend.config import DISCUSSION_ROUNDS, MAFIA_COUNT, TOTAL_PLAYERS
+from backend.config import (
+    DISCUSSION_ROUNDS,
+    MAFIA_COUNT,
+    SPEECH_CHARS_PER_SEC,
+    SPEECH_READ_HOLD_SEC,
+    TOTAL_PLAYERS,
+)
 from backend.llm_client import OllamaClient
 from backend.models import (
     ChatMessage,
@@ -44,15 +51,18 @@ class GameEngine:
         llm: OllamaClient,
         broadcast: BroadcastFn,
         spectator_delay: float = 0.8,
+        pace_speech: Optional[bool] = None,
     ) -> None:
         self.llm = llm
         self.broadcast = broadcast
         self.spectator_delay = spectator_delay
+        self.pace_speech = (spectator_delay > 0) if pace_speech is None else pace_speech
         self.state = GameState()
         self._loop_task: Optional[asyncio.Task] = None
         self._human_event = asyncio.Event()
         self._human_payload: dict = {}
         self._start_seat_offset: int = 0
+        self._last_stream_started_at: Optional[float] = None
 
     async def stop_current_game(self) -> None:
         if self._loop_task and not self._loop_task.done():
@@ -67,8 +77,9 @@ class GameEngine:
         self.state.active_speaker_seat = None
 
     async def reset_to_lobby(self) -> None:
+        prev_model = self.state.ai_model or self.llm.model
         await self.stop_current_game()
-        self.state = GameState(phase=Phase.LOBBY, ai_model=self.llm.model)
+        self.state = GameState(phase=Phase.LOBBY, ai_model=prev_model)
         await self.push_state()
 
     def _all_player_names(self) -> list[str]:
@@ -107,7 +118,14 @@ class GameEngine:
         is_public_day: bool = True,
         fallback_kind: str = "discussion",
     ) -> dict[str, str]:
+        self._last_stream_started_at = None
+        last_stream_len = 0
+
         async def _stream_partial(partial_text: str) -> None:
+            nonlocal last_stream_len
+            if self._last_stream_started_at is None or len(partial_text) < last_stream_len:
+                self._last_stream_started_at = time.monotonic()
+            last_stream_len = len(partial_text)
             await self.broadcast(
                 {
                     "type": "stream_chunk",
@@ -131,6 +149,7 @@ class GameEngine:
             if fallback_kind == "discussion"
             else None,
             on_stream_text=_stream_partial if (is_public_day and valid_targets is None) else None,
+            model=self.state.ai_model,
         )
 
     def serialize_for_human(self) -> dict:
@@ -198,9 +217,7 @@ class GameEngine:
     ) -> None:
         await self.stop_current_game()
 
-        if ai_model and ai_model.strip():
-            self.llm.set_model(ai_model.strip())
-
+        chosen_model = (ai_model or self.state.ai_model or self.llm.model).strip() or self.llm.model
         clean_name = (human_name or "Игрок").strip()[:20] or "Игрок"
         h_gender = Gender.FEMALE if human_gender == "F" else Gender.MALE
 
@@ -247,7 +264,7 @@ class GameEngine:
             phase=Phase.NIGHT,
             day=1,
             round_num=1,
-            ai_model=self.llm.model,
+            ai_model=chosen_model,
             players=players,
         )
         self._start_seat_offset = random.randint(0, TOTAL_PLAYERS - 1)
@@ -260,7 +277,7 @@ class GameEngine:
                 partner_info = f" Ваш напарник по мафии — {partners[0]}."
 
         self._add_system_message(
-            f"Партия началась! За столом 7 игроков: 2 мафии, 1 комиссар, 1 доктор и 3 мирных (модель ИИ: {self.llm.model}). "
+            f"Партия началась! За столом 7 игроков: 2 мафии, 1 комиссар, 1 доктор и 3 мирных (модель ИИ: {chosen_model}). "
             "Игра идёт в закрытую, а в первую ночь мафия никого не убивает."
         )
         if human:
@@ -389,7 +406,9 @@ class GameEngine:
                 visibility="public",
                 thought=res["thought"],
             )
-            await self._pace_if_spectating()
+            self.state.active_speaker_seat = None
+            await self.push_state()
+            await self._pace_public_ai_speech(res["speech"], was_streamed=True)
 
         self.state.awaiting_last_word_seat = None
         self.state.active_speaker_seat = None
@@ -418,6 +437,39 @@ class GameEngine:
             return True
 
         return False
+
+    def _compute_speech_pace_delay(
+        self,
+        speech: str,
+        stream_started_at: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> float:
+        """
+        Calculate how long to keep an AI speech bubble on screen so the frontend
+        typewriter (~22 chars/sec) finishes typing and the human has time to read it.
+        """
+        if not self.pace_speech:
+            return 0.0
+        cleaned = speech.strip()
+        if not cleaned:
+            return 0.0
+        total_type_sec = len(cleaned) / max(5.0, SPEECH_CHARS_PER_SEC)
+        already_elapsed = 0.0
+        if stream_started_at is not None:
+            ref_now = time.monotonic() if now is None else now
+            already_elapsed = max(0.0, ref_now - stream_started_at)
+        remaining_type_sec = max(0.0, total_type_sec - already_elapsed)
+        return remaining_type_sec + SPEECH_READ_HOLD_SEC
+
+    async def _pace_public_ai_speech(self, speech: str, was_streamed: bool) -> None:
+        delay = self._compute_speech_pace_delay(
+            speech,
+            stream_started_at=self._last_stream_started_at if was_streamed else None,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+        else:
+            await self._pace_if_spectating()
 
     async def _pace_if_spectating(self) -> None:
         human = self.state.human_player()
@@ -685,6 +737,10 @@ class GameEngine:
                         text=payload["text"],
                         visibility="public",
                     )
+                    self.state.active_speaker_seat = None
+                    await self.push_state()
+                    if self.pace_speech:
+                        await asyncio.sleep(0.8)
                 else:
                     sys_prompt = build_system_prompt(player, self.state)
                     user_prompt = build_discussion_task_prompt(player, self.state)
@@ -702,9 +758,9 @@ class GameEngine:
                         visibility="public",
                         thought=res["thought"],
                     )
-                    await self._pace_if_spectating()
-
-                await self.push_state()
+                    self.state.active_speaker_seat = None
+                    await self.push_state()
+                    await self._pace_public_ai_speech(res["speech"], was_streamed=True)
 
         self.state.active_speaker_seat = None
         await self.push_state()
@@ -782,6 +838,8 @@ class GameEngine:
                     fallback_kind="vote",
                 )
                 target_name = res["target"]
+                self.state.current_votes[player.name] = target_name
+                day_rec.votes[player.name] = target_name
                 self._add_Message_direct(
                     sender_seat=player.seat,
                     sender_name=player.name,
@@ -790,11 +848,17 @@ class GameEngine:
                     thought=res["thought"],
                     vote_target=target_name,
                 )
-                await self._pace_if_spectating()
+                self.state.active_speaker_seat = None
+                await self.push_state()
+                await self._pace_public_ai_speech(res["speech"], was_streamed=False)
+                continue
 
             self.state.current_votes[player.name] = target_name
             day_rec.votes[player.name] = target_name
+            self.state.active_speaker_seat = None
             await self.push_state()
+            if self.pace_speech:
+                await asyncio.sleep(0.8)
 
         self.state.active_speaker_seat = None
 

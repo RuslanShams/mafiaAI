@@ -5,14 +5,146 @@
   let renderedMessageCount = 0;
   let firstRenderedMessageId = null;
   let lastPhase = null;
-  let liveStream = null; // { seat, sender_name, day, text }
   let lastShownBubbleSeat = null;
+  let serverSlots = { max_sessions: 4, active_games: 0, free_slots: 4, locked_model: null };
+
+  // Smooth typewriter state (~22 chars/sec so humans comfortably read every comic speech bubble)
+  const TYPEWRITER_CHAR_MS = 45;
+  let lastTypedMsgId = null;
+  const typewriter = {
+    key: null,
+    msgId: null,
+    seat: null,
+    senderName: "",
+    day: 0,
+    fullText: "",
+    shownLen: 0,
+    isFinal: false,
+    voteTarget: null,
+    isLastWord: false,
+    isMafia: false,
+    timerId: null,
+  };
+
+  function isTypewriterActive() {
+    return Boolean(
+      typewriter.key && (!typewriter.isFinal || typewriter.shownLen < typewriter.fullText.length)
+    );
+  }
+
+  function stopTypewriter(flushDom = true) {
+    if (typewriter.timerId) {
+      clearInterval(typewriter.timerId);
+      typewriter.timerId = null;
+    }
+    if (flushDom && typewriter.msgId && chatFeed) {
+      const committedTextEl = chatFeed.querySelector(
+        `.msg-bubble[data-msg-id="${typewriter.msgId}"] .msg-text`
+      );
+      if (committedTextEl) {
+        committedTextEl.textContent = typewriter.fullText;
+      }
+      lastTypedMsgId = typewriter.msgId;
+    }
+    typewriter.key = null;
+    typewriter.msgId = null;
+    typewriter.seat = null;
+    typewriter.senderName = "";
+    typewriter.day = 0;
+    typewriter.fullText = "";
+    typewriter.shownLen = 0;
+    typewriter.isFinal = false;
+    typewriter.voteTarget = null;
+    typewriter.isLastWord = false;
+    typewriter.isMafia = false;
+  }
+
+  function tickTypewriter() {
+    if (!typewriter.key) {
+      stopTypewriter(false);
+      return;
+    }
+    if (typewriter.shownLen < typewriter.fullText.length) {
+      typewriter.shownLen += 1;
+      const visible = typewriter.fullText.slice(0, typewriter.shownLen);
+      const stillGoing = !typewriter.isFinal || typewriter.shownLen < typewriter.fullText.length;
+      const displayStr = stillGoing ? visible + "▌" : visible;
+
+      const comicEl = seatsLayer.querySelector(
+        `.comic-speech[data-seat="${typewriter.seat}"] .comic-speech-text`
+      );
+      if (comicEl) {
+        comicEl.textContent = displayStr;
+      }
+
+      const streamBubbleText = document.querySelector("#liveStreamBubble .msg-text");
+      if (streamBubbleText) {
+        streamBubbleText.textContent = displayStr;
+        chatFeed.scrollTop = chatFeed.scrollHeight;
+      } else if (typewriter.msgId) {
+        const committedTextEl = chatFeed.querySelector(
+          `.msg-bubble[data-msg-id="${typewriter.msgId}"] .msg-text`
+        );
+        if (committedTextEl) {
+          committedTextEl.textContent = displayStr;
+          chatFeed.scrollTop = chatFeed.scrollHeight;
+        }
+      }
+
+      if (!stillGoing) {
+        lastTypedMsgId = typewriter.msgId;
+        clearInterval(typewriter.timerId);
+        typewriter.timerId = null;
+        typewriter.key = null;
+        if (gameState) {
+          const human = gameState.players.find((p) => p.is_human);
+          renderTableScene(gameState);
+          renderActionBar(gameState, human);
+        }
+      }
+    } else if (typewriter.isFinal) {
+      lastTypedMsgId = typewriter.msgId;
+      clearInterval(typewriter.timerId);
+      typewriter.timerId = null;
+      typewriter.key = null;
+      if (gameState) {
+        const human = gameState.players.find((p) => p.is_human);
+        renderTableScene(gameState);
+        renderActionBar(gameState, human);
+      }
+    } else {
+      // Caught up with latest stream_chunk; pause timer until next chunk or final state
+      clearInterval(typewriter.timerId);
+      typewriter.timerId = null;
+    }
+  }
+
+  function ensureTypewriterTimer() {
+    if (!typewriter.timerId && typewriter.key) {
+      typewriter.timerId = setInterval(tickTypewriter, TYPEWRITER_CHAR_MS);
+    }
+  }
+
+  function getOrCreateTabSessionId() {
+    let sid = sessionStorage.getItem("mafia_tab_session_id");
+    if (!sid || !/^[A-Za-z0-9_-]{6,64}$/.test(sid)) {
+      sid =
+        (window.crypto && window.crypto.randomUUID
+          ? window.crypto.randomUUID().replace(/-/g, "").slice(0, 16)
+          : Math.random().toString(36).slice(2, 10) + Date.now().toString(36));
+      sessionStorage.setItem("mafia_tab_session_id", sid);
+    }
+    return sid;
+  }
+
+  const tabSessionId = getOrCreateTabSessionId();
 
   // Elements
   const appShell = document.getElementById("appShell");
   const phaseBadge = document.getElementById("phaseBadge");
   const roleBadge = document.getElementById("roleBadge");
   const aliveCountLabel = document.getElementById("aliveCountLabel");
+  const slotsBadge = document.getElementById("slotsBadge");
   const ollamaStatusBtn = document.getElementById("ollamaStatusBtn");
   const ollamaDot = document.getElementById("ollamaDot");
   const ollamaText = document.getElementById("ollamaText");
@@ -54,15 +186,22 @@
 
   function connectWebSocket() {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${window.location.host}/ws/game`);
+    ws = new WebSocket(
+      `${proto}//${window.location.host}/ws/game?session_id=${encodeURIComponent(tabSessionId)}`
+    );
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
-      if (msg.type === "state") {
+      if (msg.type === "session") {
+        if (msg.slots) renderSlots(msg.slots);
+      } else if (msg.type === "slots") {
+        renderSlots(msg.slots);
+      } else if (msg.type === "state") {
         handleStateUpdate(msg.state);
       } else if (msg.type === "stream_chunk") {
         handleStreamChunk(msg);
       } else if (msg.type === "health") {
+        if (msg.health && msg.health.slots) renderSlots(msg.health.slots);
         renderHealth(msg.health);
       } else if (msg.type === "error") {
         alert(msg.message);
@@ -82,6 +221,21 @@
     }
   }
 
+  function renderSlots(slots) {
+    if (!slots) return;
+    serverSlots = slots;
+    if (slotsBadge) {
+      slotsBadge.textContent = `Столы: ${slots.active_games} / ${slots.max_sessions}`;
+    }
+    if (slots.locked_model && modelSelect && (!gameState || gameState.phase === "lobby")) {
+      modelSelect.value = slots.locked_model;
+      modelSelect.disabled = true;
+      lobbyModelCode.textContent = slots.locked_model;
+    } else if (modelSelect && modelSelect.options.length > 0 && modelSelect.options[0].value) {
+      modelSelect.disabled = false;
+    }
+  }
+
   function renderHealth(h) {
     const modelsDetail =
       h.models_detail && h.models_detail.length > 0
@@ -92,8 +246,13 @@
     const availableNames = modelsDetail.map((m) => m.name);
 
     if (modelsDetail.length > 0) {
-      let chosen = h.configured_model;
-      if (savedModel && availableNames.includes(savedModel) && (!gameState || gameState.phase === "lobby")) {
+      let chosen = serverSlots.locked_model || h.configured_model;
+      if (
+        !serverSlots.locked_model &&
+        savedModel &&
+        availableNames.includes(savedModel) &&
+        (!gameState || gameState.phase === "lobby")
+      ) {
         chosen = savedModel;
         if (chosen !== h.configured_model) {
           sendAction({ action: "select_model", model: chosen });
@@ -110,7 +269,7 @@
         if (m.name === chosen) opt.selected = true;
         modelSelect.appendChild(opt);
       });
-      modelSelect.disabled = false;
+      modelSelect.disabled = Boolean(serverSlots.locked_model);
       startGameBtn.disabled = false;
       lobbyModelCode.textContent = chosen;
     } else {
@@ -144,10 +303,32 @@
   }
 
   function handleStreamChunk(chunk) {
-    const isSameStreamingSeat = Boolean(liveStream && liveStream.seat === chunk.seat);
-    liveStream = chunk;
+    const phase = gameState ? gameState.phase : "day_discussion";
+    const round = gameState ? gameState.round_num : 1;
+    const streamKey = `stream:${chunk.day}:${phase}:${round}:${chunk.seat}`;
+    const isSameStream = typewriter.key === streamKey;
 
-    // Update chronicle streaming bubble in-place
+    if (!isSameStream) {
+      stopTypewriter(true);
+      typewriter.key = streamKey;
+      typewriter.msgId = null;
+      typewriter.seat = chunk.seat;
+      typewriter.senderName = chunk.sender_name;
+      typewriter.day = chunk.day;
+      typewriter.fullText = chunk.text;
+      typewriter.shownLen = Math.min(1, chunk.text.length);
+      typewriter.isFinal = false;
+      typewriter.voteTarget = null;
+      typewriter.isLastWord = chunk.sender_name.includes("Последнее слово");
+      typewriter.isMafia = false;
+    } else {
+      typewriter.fullText = chunk.text;
+      if (typewriter.shownLen > chunk.text.length) {
+        typewriter.shownLen = chunk.text.length;
+      }
+    }
+
+    // Update chronicle streaming bubble with typewriter-paced prefix
     let bubble = document.getElementById("liveStreamBubble");
     if (!bubble) {
       bubble = document.createElement("div");
@@ -164,36 +345,85 @@
     }
     bubble.querySelector(".msg-author").textContent = chunk.sender_name;
     bubble.querySelector(".msg-meta").textContent = `День ${chunk.day} · говорит...`;
-    bubble.querySelector(".msg-text").textContent = chunk.text + "▌";
+    bubble.querySelector(".msg-text").textContent =
+      typewriter.fullText.slice(0, typewriter.shownLen) + "▌";
     chatFeed.scrollTop = chatFeed.scrollHeight;
 
-    // Update comic speech bubble on the table IN-PLACE so it NEVER flickers!
-    const existingTextEl = seatsLayer.querySelector(
-      `.comic-speech[data-seat="${chunk.seat}"] .comic-speech-text`
-    );
-    if (isSameStreamingSeat && existingTextEl) {
-      existingTextEl.textContent = chunk.text + "▌";
-    } else if (gameState) {
+    if (!isSameStream && gameState) {
       renderTableScene(gameState);
+      const human = gameState.players.find((p) => p.is_human);
+      renderActionBar(gameState, human);
     }
+    ensureTypewriterTimer();
   }
 
   function handleStateUpdate(state) {
+    const wasInitialLoad = !gameState;
     const currentFirstId = state.messages.length > 0 ? state.messages[0].id : null;
-    const isNewGameOrReset =
+    const isHardReset =
       !gameState ||
       state.messages.length < renderedMessageCount ||
-      currentFirstId !== firstRenderedMessageId ||
+      currentFirstId !== firstRenderedMessageId;
+    const isNewGameOrReset =
+      isHardReset ||
       (!gameState.spectator_reveal && state.spectator_reveal) ||
       (lastPhase !== "game_over" && state.phase === "game_over");
 
-    // Clear live stream when a new message is committed or speaker changes
-    if (
-      !liveStream ||
-      state.messages.length > renderedMessageCount ||
-      state.active_speaker_seat !== liveStream.seat
-    ) {
-      liveStream = null;
+    if (state.phase === "lobby" || (isHardReset && !wasInitialLoad)) {
+      stopTypewriter(false);
+      lastTypedMsgId = null;
+    }
+
+    // Sync or initiate smooth typewriter for the latest spoken message
+    let latestBubbleMsg = null;
+    if (state.phase !== "night" && state.phase !== "lobby") {
+      latestBubbleMsg = [...state.messages]
+        .reverse()
+        .find((m) => m.visibility === "public" && m.sender_seat !== null);
+    } else if (state.phase === "night") {
+      latestBubbleMsg = [...state.messages]
+        .reverse()
+        .find((m) => m.visibility === "mafia" && m.day === state.day && m.sender_seat !== null);
+    }
+
+    if (latestBubbleMsg) {
+      const senderPlayer = (state.players || []).find((p) => p.seat === latestBubbleMsg.sender_seat);
+      const isHumanMsg = Boolean(senderPlayer && senderPlayer.is_human);
+      if (isHumanMsg || (wasInitialLoad && state.messages.length > 2) || state.phase === "game_over") {
+        stopTypewriter(true);
+        lastTypedMsgId = latestBubbleMsg.id;
+      } else if (latestBubbleMsg.id !== lastTypedMsgId) {
+        if (typewriter.key && !typewriter.isFinal && typewriter.seat === latestBubbleMsg.sender_seat) {
+          // Seamlessly continue typing from live stream into committed message without jumping!
+          typewriter.key = latestBubbleMsg.id;
+          typewriter.msgId = latestBubbleMsg.id;
+          typewriter.fullText = latestBubbleMsg.text;
+          typewriter.shownLen = Math.min(typewriter.shownLen, latestBubbleMsg.text.length);
+          typewriter.isFinal = true;
+          typewriter.voteTarget = latestBubbleMsg.vote_target;
+          typewriter.isLastWord = latestBubbleMsg.sender_name.includes("Последнее слово");
+          typewriter.isMafia = latestBubbleMsg.visibility === "mafia";
+          ensureTypewriterTimer();
+        } else if (typewriter.msgId !== latestBubbleMsg.id) {
+          stopTypewriter(true);
+          if (!(state.phase === "night" && state.day === 1)) {
+            typewriter.key = latestBubbleMsg.id;
+            typewriter.msgId = latestBubbleMsg.id;
+            typewriter.seat = latestBubbleMsg.sender_seat;
+            typewriter.senderName = latestBubbleMsg.sender_name;
+            typewriter.day = latestBubbleMsg.day;
+            typewriter.fullText = latestBubbleMsg.text;
+            typewriter.shownLen = Math.min(1, latestBubbleMsg.text.length);
+            typewriter.isFinal = true;
+            typewriter.voteTarget = latestBubbleMsg.vote_target;
+            typewriter.isLastWord = latestBubbleMsg.sender_name.includes("Последнее слово");
+            typewriter.isMafia = latestBubbleMsg.visibility === "mafia";
+            ensureTypewriterTimer();
+          } else {
+            lastTypedMsgId = latestBubbleMsg.id;
+          }
+        }
+      }
     }
 
     gameState = state;
@@ -419,16 +649,16 @@
     }
 
     // Determine which single comic speech bubble should be displayed right now
-    // Priority 1: Live streaming speech
-    // Priority 2: Most recent non-system message in the current day/phase (if not hidden at night)
+    // Priority 1: Active typewriter animation (types smoothly at ~22 chars/sec)
+    // Priority 2: Most recent completed message in the current day/phase
     let activeBubble = null;
-    if (liveStream && state.phase !== "night") {
+    if (isTypewriterActive() && (state.phase !== "night" || typewriter.isMafia)) {
       activeBubble = {
-        seat: liveStream.seat,
-        text: liveStream.text + "▌",
-        vote_target: null,
-        isLastWord: false,
-        isMafia: false,
+        seat: typewriter.seat,
+        text: typewriter.fullText.slice(0, typewriter.shownLen) + "▌",
+        vote_target: typewriter.shownLen >= typewriter.fullText.length ? typewriter.voteTarget : null,
+        isLastWord: typewriter.isLastWord,
+        isMafia: typewriter.isMafia,
       };
     } else if (state.phase !== "night") {
       const recentSpoken = [...state.messages]
@@ -467,15 +697,15 @@
         state.active_speaker_seat === p.seat &&
         (state.phase !== "night" || p.is_human);
 
-      const isStreamingThis = Boolean(liveStream && liveStream.seat === p.seat);
-      // Show comic thought cloud ("Думает...") ONLY when an AI is thinking during non-Night and hasn't started streaming words yet
+      const isTypingThis = Boolean(isTypewriterActive() && typewriter.seat === p.seat);
+      // Show comic thought cloud ("Думает...") ONLY when an AI is thinking during non-Night and hasn't started typing yet
       const isThinking = Boolean(
-        isVisibleActive && !p.is_human && !isStreamingThis && state.phase !== "night"
+        isVisibleActive && !p.is_human && !isTypingThis && state.phase !== "night"
       );
       const hasSpeechBubble = Boolean(
         activeBubble && activeBubble.seat === p.seat && !isThinking
       );
-      const isSpeaking = Boolean(isStreamingThis || (hasSpeechBubble && isVisibleActive));
+      const isSpeaking = Boolean(isTypingThis || (hasSpeechBubble && isVisibleActive && p.is_human));
 
       const node = document.createElement("div");
       node.className = `seat-node seat-slot-${slotIdx}`;
@@ -608,6 +838,7 @@
       } else {
         const div = document.createElement("div");
         div.className = "msg-bubble";
+        div.dataset.msgId = m.id;
         if (human && m.sender_seat === human.seat && m.visibility === "public") {
           div.classList.add("msg-human");
         }
@@ -630,13 +861,17 @@
         const voteHtml = m.vote_target
           ? `<div class="vote-pill">Голос против: ${escapeHtml(m.vote_target)}</div>`
           : "";
+        const initialMsgText =
+          isTypewriterActive() && typewriter.msgId === m.id
+            ? typewriter.fullText.slice(0, typewriter.shownLen) + "▌"
+            : m.text;
 
         div.innerHTML = `
           <div class="msg-header">
             <span class="msg-author">${escapeHtml(m.sender_name)}</span>
             <span class="msg-meta">${phaseTag}</span>
           </div>
-          <div class="msg-text">${escapeHtml(m.text)}</div>
+          <div class="msg-text">${escapeHtml(initialMsgText)}</div>
           ${voteHtml}
         `;
         chatFeed.appendChild(div);
@@ -719,19 +954,27 @@
 
     waitingStatusLine.classList.remove("hidden");
     const activePlayer = state.players.find((p) => p.seat === state.active_speaker_seat);
+    const typingPlayer =
+      isTypewriterActive() && typewriter.seat
+        ? state.players.find((p) => p.seat === typewriter.seat)
+        : null;
     if (human && !human.is_alive) {
       waitingStatusText.textContent =
         state.phase === "night"
           ? "Вы выбыли (режим наблюдателя — все роли раскрыты) · Ночь: мафия выбирает жертву..."
+          : typingPlayer
+          ? `Вы выбыли (режим наблюдателя — все роли раскрыты) · Говорит ${typingPlayer.name}...`
           : activePlayer
           ? `Вы выбыли (режим наблюдателя — все роли раскрыты) · Сейчас ходит ${activePlayer.name}...`
           : "Вы выбыли (режим наблюдателя — все роли раскрыты) · ИИ продолжают партию...";
     } else if (state.phase === "night") {
       waitingStatusText.textContent = "Город спит... Мафия выбирает жертву.";
+    } else if (typingPlayer) {
+      waitingStatusText.textContent = `${typingPlayer.name} говорит за столом...`;
     } else if (activePlayer) {
       waitingStatusText.textContent = `${activePlayer.name} обдумывает реплику...`;
     } else {
-      waitingStatusText.textContent = "Обработка хода...";
+      waitingStatusText.textContent = "Пауза на чтение реплики...";
     }
   }
 

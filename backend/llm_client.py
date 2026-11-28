@@ -17,6 +17,8 @@ from backend.config import (
     LLM_NUM_CTX,
     LLM_NUM_THREADS,
     LLM_TIMEOUT_SECONDS,
+    LLM_USE_GPU_MODE,
+    MAX_SESSIONS,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     PREDICT_TOKENS_DISCUSSION,
@@ -380,12 +382,29 @@ def _predict_budget_for_kind(kind: str) -> int:
     return PREDICT_TOKENS_DISCUSSION
 
 
+def _build_ollama_extra_options() -> dict:
+    opts: dict = {
+        "num_ctx": LLM_NUM_CTX,
+        "num_batch": LLM_NUM_BATCH,
+    }
+    # Only pin CPU threads on CPU-only laptops; on CUDA GPU let Ollama run full GPU layers unthrottled
+    if not LLM_USE_GPU_MODE:
+        opts["num_thread"] = LLM_NUM_THREADS
+    return opts
+
+
 class OllamaClient:
     def __init__(self, base_url: str = OLLAMA_BASE_URL, model: str = OLLAMA_MODEL) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._client: Optional[httpx.AsyncClient] = None
         self._warmup_task: Optional[asyncio.Task] = None
+        self._sem: Optional[asyncio.Semaphore] = None
+
+    def _get_sem(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(max(1, MAX_SESSIONS))
+        return self._sem
 
     def set_model(self, model_name: str) -> None:
         cleaned = model_name.strip()
@@ -394,7 +413,8 @@ class OllamaClient:
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS)
+            limits = httpx.Limits(max_connections=max(10, MAX_SESSIONS * 3), max_keepalive_connections=MAX_SESSIONS * 2)
+            self._client = httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS, limits=limits)
         return self._client
 
     async def close(self) -> None:
@@ -404,31 +424,29 @@ class OllamaClient:
             await self._client.aclose()
         self._client = None
 
-    def schedule_warmup(self) -> None:
-        """Fire-and-forget warmup so Ollama loads the chosen model with num_ctx=2048 while in lobby."""
+    def schedule_warmup(self, model_name: Optional[str] = None) -> None:
+        """Fire-and-forget warmup so Ollama loads the chosen model into VRAM/RAM while in lobby."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
         if self._warmup_task and not self._warmup_task.done():
             return
-        self._warmup_task = loop.create_task(self._warmup_impl())
+        target_model = (model_name or self.model).strip() or self.model
+        self._warmup_task = loop.create_task(self._warmup_impl(target_model))
 
-    async def _warmup_impl(self) -> None:
+    async def _warmup_impl(self, model_name: Optional[str] = None) -> None:
         try:
+            opts = _build_ollama_extra_options()
+            opts["num_predict"] = 1
             payload = {
-                "model": self.model,
+                "model": (model_name or self.model).strip() or self.model,
                 "messages": [{"role": "user", "content": "Привет"}],
                 "stream": False,
                 "keep_alive": LLM_KEEP_ALIVE,
-                "options": {
-                    "num_ctx": LLM_NUM_CTX,
-                    "num_thread": LLM_NUM_THREADS,
-                    "num_batch": LLM_NUM_BATCH,
-                    "num_predict": 1,
-                },
+                "options": opts,
             }
-            await self._get_client().post(f"{self.base_url}/api/chat", json=payload, timeout=30.0)
+            await self._get_client().post(f"{self.base_url}/api/chat", json=payload, timeout=45.0)
         except Exception:
             pass
 
@@ -451,7 +469,9 @@ class OllamaClient:
             ]
 
             if models and self.model not in models:
-                if "gemma3:4b" in models:
+                if "gemma3:12b" in models:
+                    self.model = "gemma3:12b"
+                elif "gemma3:4b" in models:
                     self.model = "gemma3:4b"
                 elif OLLAMA_MODEL in models:
                     self.model = OLLAMA_MODEL
@@ -489,10 +509,12 @@ class OllamaClient:
         dead_names: Optional[list[str]] = None,
         unspoken_names: Optional[list[str]] = None,
         on_stream_text: Optional[StreamCallback] = None,
+        model: Optional[str] = None,
     ) -> dict[str, str]:
         """
-        Stream fast plain-text turns from Ollama (no GBNF JSON overhead, KV-cache friendly).
+        Stream fast plain-text turns from Ollama (supports up to MAX_SESSIONS parallel sessions on GPU).
         """
+        active_model = (model or self.model).strip() or self.model
         t_start = time.monotonic()
         messages = [
             {"role": "system", "content": system_prompt},
@@ -504,72 +526,73 @@ class OllamaClient:
         last_error = ""
         for attempt in range(LLM_MAX_RETRIES + 1):
             try:
-                payload = {
-                    "model": self.model,
-                    "messages": messages,
-                    "stream": True,
-                    "keep_alive": LLM_KEEP_ALIVE,
-                    "options": {
-                        "num_ctx": LLM_NUM_CTX,
-                        "num_thread": LLM_NUM_THREADS,
-                        "num_batch": LLM_NUM_BATCH,
+                opts = _build_ollama_extra_options()
+                opts.update(
+                    {
                         "num_predict": num_predict,
                         "temperature": 0.65 if attempt == 0 else 0.4,
                         "top_p": 0.9,
                         "repeat_penalty": 1.12,
                         "stop": ["\n\n", "---", "ЗАДАНИЕ:", "[Ведущий]"],
-                    },
+                    }
+                )
+                payload = {
+                    "model": active_model,
+                    "messages": messages,
+                    "stream": True,
+                    "keep_alive": LLM_KEEP_ALIVE,
+                    "options": opts,
                 }
 
                 raw_chunks: list[str] = []
                 last_emit_ts = 0.0
 
-                async with self._get_client().stream(
-                    "POST", f"{self.base_url}/api/chat", json=payload
-                ) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        chunk_data = json.loads(line)
-                        piece = chunk_data.get("message", {}).get("content", "")
-                        if piece:
-                            raw_chunks.append(piece)
-                            if can_live_stream and on_stream_text is not None:
-                                now = time.monotonic()
-                                if now - last_emit_ts >= 0.08:
-                                    preview = clean_speech_text("".join(raw_chunks), speaker_name=player.name)
-                                    # Hold stream if Mafia confesses or speaker slips into 3rd-person self-name
-                                    has_self_3rd = bool(
-                                        player.name and build_name_mention_regex(player.name).search(preview)
-                                    )
-                                    has_dead_err = bool(
-                                        is_public_day and dead_names and _check_dead_player_misuse(preview, dead_names)
-                                    )
-                                    has_unspoken_err = bool(
-                                        is_public_day
-                                        and unspoken_names
-                                        and _check_unspoken_player_hallucination(preview, unspoken_names)
-                                    )
-                                    has_silence_err = bool(
-                                        is_public_day and SILENCE_ACCUSATION_RE.search(preview)
-                                    )
-                                    if (
-                                        preview
-                                        and not has_self_3rd
-                                        and not has_silence_err
-                                        and not has_dead_err
-                                        and not has_unspoken_err
-                                        and not (
-                                            is_public_day
-                                            and player.role == Role.MAFIA
-                                            and MAFIA_CONFESSION_RE.search(preview)
+                async with self._get_sem():
+                    async with self._get_client().stream(
+                        "POST", f"{self.base_url}/api/chat", json=payload
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line:
+                                continue
+                            chunk_data = json.loads(line)
+                            piece = chunk_data.get("message", {}).get("content", "")
+                            if piece:
+                                raw_chunks.append(piece)
+                                if can_live_stream and on_stream_text is not None:
+                                    now = time.monotonic()
+                                    if now - last_emit_ts >= 0.08:
+                                        preview = clean_speech_text("".join(raw_chunks), speaker_name=player.name)
+                                        has_self_3rd = bool(
+                                            player.name and build_name_mention_regex(player.name).search(preview)
                                         )
-                                    ):
-                                        last_emit_ts = now
-                                        await on_stream_text(preview)
-                        if chunk_data.get("done"):
-                            break
+                                        has_dead_err = bool(
+                                            is_public_day and dead_names and _check_dead_player_misuse(preview, dead_names)
+                                        )
+                                        has_unspoken_err = bool(
+                                            is_public_day
+                                            and unspoken_names
+                                            and _check_unspoken_player_hallucination(preview, unspoken_names)
+                                        )
+                                        has_silence_err = bool(
+                                            is_public_day and SILENCE_ACCUSATION_RE.search(preview)
+                                        )
+                                        if (
+                                            preview
+                                            and not has_self_3rd
+                                            and not has_silence_err
+                                            and not has_dead_err
+                                            and not has_unspoken_err
+                                            and not (
+                                                is_public_day
+                                                and player.role == Role.MAFIA
+                                                and MAFIA_CONFESSION_RE.search(preview)
+                                            )
+                                        ):
+                                            last_emit_ts = now
+                                            await on_stream_text(preview)
+                            if chunk_data.get("done"):
+                                break
 
                 raw_content = "".join(raw_chunks)
 

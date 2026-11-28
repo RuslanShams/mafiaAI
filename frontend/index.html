@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Мафия AI — Настольная игра (Ollama)</title>
-  <link rel="stylesheet" href="/static/style.css?v=8" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
   <div class="app-shell" id="appShell">
@@ -22,6 +22,7 @@
       </div>
 
       <div class="right-controls">
+        <span class="badge muted-badge" id="slotsBadge" title="Количество активных партий на сервере">Столы: 0 / 4</span>
         <button class="ollama-pill" id="ollamaStatusBtn" title="Нажмите, чтобы перепроверить связь с Ollama">
           <span class="dot" id="ollamaDot"></span>
           <span id="ollamaText">Проверка Ollama...</span>
@@ -199,6 +200,6 @@
     </main>
   </div>
 
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

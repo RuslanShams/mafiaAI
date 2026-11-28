@@ -8,9 +8,9 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.engine import GameEngine
 from backend.llm_client import OllamaClient
 from backend.models import Phase
+from backend.session_manager import SessionManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,43 +20,18 @@ logger = logging.getLogger("mafia.app")
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-
-class ConnectionManager:
-    def __init__(self) -> None:
-        self.active: list[WebSocket] = []
-
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
-        self.active.append(ws)
-
-    def disconnect(self, ws: WebSocket) -> None:
-        if ws in self.active:
-            self.active.remove(ws)
-
-    async def broadcast(self, message: dict) -> None:
-        stale: list[WebSocket] = []
-        for ws in list(self.active):
-            try:
-                await ws.send_json(message)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            self.disconnect(ws)
-
-
-ws_manager = ConnectionManager()
 llm_client = OllamaClient()
-game_engine = GameEngine(llm=llm_client, broadcast=ws_manager.broadcast)
+session_manager = SessionManager(llm=llm_client)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     yield
-    await game_engine.stop_current_game()
+    await session_manager.shutdown_all()
     await llm_client.close()
 
 
-app = FastAPI(title="Мафия AI (qwen2.5:7b)", lifespan=lifespan)
+app = FastAPI(title="Мафия AI (Ollama Multi-Session)", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
@@ -76,57 +51,93 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def api_health() -> dict:
-    return await llm_client.check_health()
+    await session_manager.cleanup_stale_sessions()
+    health = await llm_client.check_health()
+    health["slots"] = session_manager.slots_summary()
+    return health
 
 
 @app.websocket("/ws/game")
 async def ws_game(websocket: WebSocket) -> None:
-    await ws_manager.connect(websocket)
+    await session_manager.cleanup_stale_sessions()
+    raw_sid = websocket.query_params.get("session_id")
+    session = session_manager.get_or_create(raw_sid)
+    engine = session.engine
+
+    await session.sockets.connect(websocket)
     try:
-        # Send initial state and Ollama status immediately on connect
-        await websocket.send_json({"type": "state", "state": game_engine.serialize_for_human()})
         health = await llm_client.check_health()
+        if engine.state.phase == Phase.LOBBY and health.get("available_models"):
+            locked = session_manager.active_locked_model(exclude_sid=session.session_id)
+            if locked and locked in health["available_models"]:
+                engine.state.ai_model = locked
+            elif engine.state.ai_model not in health["available_models"]:
+                engine.state.ai_model = health["configured_model"]
+
+        await websocket.send_json(
+            {
+                "type": "session",
+                "session_id": session.session_id,
+                "slots": session_manager.slots_summary(),
+            }
+        )
+        await websocket.send_json({"type": "state", "state": engine.serialize_for_human()})
         await websocket.send_json({"type": "health", "health": health})
-        if health.get("ollama_online") and health.get("model_ready") and game_engine.state.phase == Phase.LOBBY:
-            llm_client.schedule_warmup()
+
+        if health.get("ollama_online") and health.get("model_ready") and engine.state.phase == Phase.LOBBY:
+            llm_client.schedule_warmup(engine.state.ai_model)
 
         while True:
             data = await websocket.receive_json()
+            session.touch()
             action = data.get("action")
 
             if action == "check_health":
                 health = await llm_client.check_health()
                 await websocket.send_json({"type": "health", "health": health})
+                await websocket.send_json({"type": "slots", "slots": session_manager.slots_summary()})
 
             elif action == "select_model":
-                if game_engine.state.phase in (Phase.LOBBY, Phase.GAME_OVER):
-                    chosen = str(data.get("model", "")).strip()
+                if engine.state.phase in (Phase.LOBBY, Phase.GAME_OVER):
+                    locked = session_manager.active_locked_model(exclude_sid=session.session_id)
+                    chosen = locked or str(data.get("model", "")).strip()
                     if chosen:
-                        llm_client.set_model(chosen)
-                        game_engine.state.ai_model = llm_client.model
+                        if not session_manager.active_playing_sessions():
+                            llm_client.set_model(chosen)
+                        engine.state.ai_model = chosen
                         health = await llm_client.check_health()
-                        await ws_manager.broadcast({"type": "health", "health": health})
-                        await game_engine.push_state()
-                        if health.get("ollama_online") and health.get("model_ready"):
-                            llm_client.schedule_warmup()
+                        await session.sockets.broadcast({"type": "health", "health": health})
+                        await engine.push_state()
+                        if health.get("ollama_online") and health.get("model_ready") and not locked:
+                            llm_client.schedule_warmup(chosen)
 
             elif action == "start_game":
+                can_start, err_msg = await session_manager.can_start_game(session)
+                if not can_start:
+                    await websocket.send_json({"type": "error", "message": err_msg})
+                    await websocket.send_json({"type": "slots", "slots": session_manager.slots_summary()})
+                    continue
+
                 player_name = str(data.get("name", "Игрок"))
                 player_gender = str(data.get("gender", "M"))
-                chosen_model = str(data.get("model", "")).strip() or None
-                await game_engine.start_new_game(
+                locked = session_manager.active_locked_model(exclude_sid=session.session_id)
+                chosen_model = locked or str(data.get("model", "")).strip() or None
+                if chosen_model and not locked:
+                    llm_client.set_model(chosen_model)
+
+                await engine.start_new_game(
                     human_name=player_name,
                     human_gender=player_gender,
                     ai_model=chosen_model,
                 )
-                health = await llm_client.check_health()
-                await ws_manager.broadcast({"type": "health", "health": health})
+                await session_manager.broadcast_slots_to_all()
 
             elif action == "reset_lobby":
-                await game_engine.reset_to_lobby()
+                await engine.reset_to_lobby()
+                await session_manager.broadcast_slots_to_all()
 
             elif action in ("speak", "last_word", "vote", "night_kill", "night_heal", "night_check"):
-                ok = game_engine.submit_human_input(
+                ok = engine.submit_human_input(
                     action_type=action,
                     text=str(data.get("text", "")),
                     target=str(data.get("target", "")),
@@ -137,8 +148,11 @@ async def ws_game(websocket: WebSocket) -> None:
                     )
 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        session.sockets.disconnect(websocket)
+        await session_manager.cleanup_stale_sessions()
+        await session_manager.broadcast_slots_to_all()
     except Exception as exc:
         logger.warning("WebSocket connection closed with error: %s", exc)
-        ws_manager.disconnect(websocket)
-
+        session.sockets.disconnect(websocket)
+        await session_manager.cleanup_stale_sessions()
+        await session_manager.broadcast_slots_to_all()
